@@ -11,7 +11,7 @@ from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classifica
 from damage.guided_segmentation.custom_metrics import hit_or_miss_iou, coverage, false_positive_rate, \
     average_minimum_distance, pixel_recall, pixel_precision, pixel_f1, oversampling_objects
 from scipy.ndimage import label, binary_opening
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Iterable
 
 
 def _save_triplet_panel(img_rgb: np.ndarray, gt_mask: np.ndarray, pred_mask: np.ndarray, out_path: str,
@@ -110,6 +110,275 @@ def load_state_dict_forgiving(
     print(f"[load_state_dict_forgiving] Pesos cargados desde {ckpt_path}")
     return missing, unexpected
 
+
+def _summarize_array(arr: np.ndarray) -> Dict[str, float]:
+    """Devuelve mean/median/p90/p95 tras filtrar NaN/Inf. {} si vacío."""
+    arr = np.asarray(arr)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {}
+    return {
+        "mean": float(arr.mean()),
+        "median": float(np.median(arr)),
+        "p90": float(np.percentile(arr, 90)),
+        "p95": float(np.percentile(arr, 95)),
+    }
+
+
+def _print_subset_summaries(metrics: Dict[str, np.ndarray], has_gt: np.ndarray) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """
+    Imprime y devuelve resumen por subconjunto (with_gt / no_gt) para cada métrica por-imagen.
+    """
+    summary: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for mname, arr in metrics.items():
+        if not isinstance(arr, (np.ndarray, list, tuple)):
+            continue
+        arr = np.asarray(arr)
+        if arr.ndim == 0 or arr.shape[0] != has_gt.shape[0]:
+            continue
+        wg = _summarize_array(arr[has_gt])
+        ng = _summarize_array(arr[~has_gt])
+        summary[mname] = {"with_gt": wg, "no_gt": ng}
+        def fmt(d): return ", ".join([f"{k}={v:.4f}" for k, v in d.items()]) if d else "sin datos"
+        print(f"{mname} [with_gt]: {fmt(wg)} | [no_gt]: {fmt(ng)}")
+    return summary
+
+
+
+
+# def inference_and_test_metrics(
+#     model,
+#     test_loader,
+#     best_threshold_cls_saved,
+#     threshold,
+#     save_visuals=False,
+#     viz_limit=50,
+#     viz_out_dir=None,
+#     viz_tag="",
+#     show_confusion_and_reports=True,
+#     postprocess = True,
+#     state_dict_path=None,
+#     device="cuda" if torch.cuda.is_available() else "cpu",
+#     element_index=1,
+#     save_dir=None,
+#     postprocess_keep_top=10,
+#     postprocess_min_area=100,
+#     postprocess_apply_opening=True,
+#     postprocess_opening_iter=2,
+#     params=None  # Parámetros de normalización (mean, std) para denormalizar imágenes
+# ):
+#     """
+#     Extensión: aplica "gate" con la cabeza de clasificación y post-procesado de componentes para
+#     reducir falsos positivos manteniendo buen hit-or-miss.
+#     """
+#     load_state_dict_forgiving(model, state_dict_path, map_location=device, strict=False)
+#     # model.load_state_dict(torch.load(state_dict_path, map_location=device))
+#     model.eval()
+#     all_test_true_masks = []
+#     all_test_pred_probs = []
+#     all_test_pred_bin = []
+#     all_preds_cls, all_labels_cls = [], []
+#
+#     # Directorio de visualizaciones
+#     if save_visuals:
+#         if viz_out_dir is None:
+#             safe_tag = viz_tag if viz_tag else "viz"
+#             viz_out_dir = os.path.join(
+#                 save_dir,
+#                 f"viz_element_{element_index}_{safe_tag}_thr{threshold:.2f}_cls{best_threshold_cls_saved:.2f}"
+#             )
+#         os.makedirs(viz_out_dir, exist_ok=True)
+#
+#     dataset = getattr(test_loader, "dataset", None)
+#     sample_counter = 0
+#     saved = 0
+#
+#     with torch.no_grad():
+#         for images, masks, labels in test_loader:
+#             images, masks, labels = images.to(device), masks.to(device), labels.to(device).unsqueeze(1)
+#             seg_out, cls_out = model(images)
+#
+#             probs_cls = torch.sigmoid(cls_out)  # (B,1)
+#             preds_cls = (probs_cls > best_threshold_cls_saved).float()
+#
+#             all_preds_cls.extend(preds_cls.cpu().numpy())
+#             all_labels_cls.extend(labels.cpu().numpy())
+#             all_test_true_masks.extend(masks[:,0].cpu().numpy())
+#
+#             probs_seg = torch.sigmoid(seg_out).cpu().numpy()  # (B,1,H,W)
+#             all_test_pred_probs.extend(probs_seg[:,0])
+#
+#             B = images.shape[0]
+#             for b in range(B):
+#                 prob = probs_seg[b, 0]
+#                 cls_p = float(probs_cls[b, 0].item())
+#
+#                 # Gate: si la prob de clase no supera el umbral, anula la máscara
+#                 if cls_p <= float(best_threshold_cls_saved):
+#                     pred_bin = np.zeros_like(prob, dtype=np.float32)
+#                 else:
+#                     if postprocess:
+#                         pred_bin = postprocess_mask(
+#                             prob=prob,
+#                             thr=threshold,
+#                             keep_top=postprocess_keep_top,
+#                             min_area=postprocess_min_area,
+#                             prob_weighted=True,
+#                             apply_open=postprocess_apply_opening,
+#                             opening_iter=postprocess_opening_iter,
+#                         )
+#                     else:
+#                         pred_bin = (prob > float(threshold)).astype(np.float32)
+#                 all_test_pred_bin.append(pred_bin)
+#
+#                 # Visualizaciones
+#                 if save_visuals and saved < viz_limit:
+#                     img_rgb = _denormalize_image(images[b], params["mean"], params["std"])
+#                     gt = masks[b, 0].detach().cpu().numpy().astype(np.float32)
+#
+#                     if dataset is not None and hasattr(dataset, "df"):
+#                         try:
+#                             image_name = dataset.df.iloc[sample_counter]["image_name"]
+#                             stem = os.path.splitext(os.path.basename(image_name))[0]
+#                         except Exception:
+#                             stem = f"sample_{sample_counter:06d}"
+#                     else:
+#                         stem = f"sample_{sample_counter:06d}"
+#
+#                     out_path = os.path.join(viz_out_dir, f"{stem}_panel.png")
+#                     _save_triplet_panel(
+#                         img_rgb, gt, pred_bin, out_path,
+#                         titles=("Imagen", "Máscara GT", f"Pred (thr={threshold:.2f}, gate={best_threshold_cls_saved:.2f})")
+#                     )
+#                     saved += 1
+#                 sample_counter += 1
+#
+#     # Para clasificación
+#     all_preds_cls = [int(p[0]) for p in all_preds_cls]
+#     all_labels_cls = [int(l[0]) for l in all_labels_cls]
+#
+#     if show_confusion_and_reports:
+#         cm = confusion_matrix(all_labels_cls, all_preds_cls, normalize='true')
+#         if save_visuals:
+#             disp = ConfusionMatrixDisplay(cm, display_labels=[f"No Element {element_index}", f"Element {element_index}"])
+#             disp.plot(cmap="Blues")
+#             plt.title("Matriz de Confusión - Clasificación Test (con gate)")
+#             plt.show()
+#             print("Reporte de clasificación en Test (con gate):")
+#             print(classification_report(all_labels_cls, all_preds_cls,
+#                                         target_names=[f"No Element {element_index}", f"Element {element_index}"]))
+#     else:
+#         cm = None
+#
+#     # Métricas de segmentación con máscara post-procesada
+#     iou_list, dice_list, amd_list = [], [], []
+#     hit_or_miss_0_list, hit_or_miss_1_list = [], []
+#     hit_or_miss_25_list, hit_or_miss_5_list, hit_or_miss_75_list = [], [], []
+#     oversampling_objects_0_list, oversampling_objects_1_list = [], []
+#     oversampling_objects_25_list, oversampling_objects_50_list, oversampling_objects_75_list = [], [], []
+#     coverage_list, fp_rate_list = [], []
+#     recall_list, precision_list, f1_list = [], [], []
+#     empty_gt_total = 0
+#     empty_gt_with_pred = 0
+#     non_empty_gt_without_pred = 0
+#     non_empty_gt_total = 0
+#
+#     has_gt_list = []
+#
+#     for mask, pred_mask, prob in zip(all_test_true_masks, all_test_pred_bin, all_test_pred_probs):
+#         has_gt = (mask.sum() > 0)
+#         has_gt_list.append(has_gt)
+#
+#         if not has_gt:
+#             empty_gt_total += 1
+#             if pred_mask.sum() > 0:
+#                 empty_gt_with_pred += 1
+#         else:
+#             non_empty_gt_total += 1
+#             if pred_mask.sum() == 0: # Gt no vacio, pred vacio
+#                 non_empty_gt_without_pred += 1
+#
+#
+#
+#         intersection = (pred_mask * mask).sum()
+#         union = ((pred_mask + mask) > 0).sum()
+#         iou = intersection / (union + 1e-8)
+#         iou_list.append(iou)
+#         dice = 2 * intersection / (pred_mask.sum() + mask.sum() + 1e-8)
+#         dice_list.append(dice)
+#         hit_or_miss_0_list.append(hit_or_miss_iou(mask, pred_mask, iou_thresh=0.0))
+#         hit_or_miss_1_list.append(hit_or_miss_iou(mask, pred_mask, iou_thresh=0.1))
+#         hit_or_miss_25_list.append(hit_or_miss_iou(mask, pred_mask, iou_thresh=0.25))
+#         hit_or_miss_5_list.append(hit_or_miss_iou(mask, pred_mask, iou_thresh=0.5))
+#         hit_or_miss_75_list.append(hit_or_miss_iou(mask, pred_mask, iou_thresh=0.75))
+#         oversampling_objects_0_list.append(oversampling_objects(mask, pred_mask, iou_thresh=0.0))
+#         oversampling_objects_1_list.append(oversampling_objects(mask, pred_mask, iou_thresh=0.1))
+#         oversampling_objects_25_list.append(oversampling_objects(mask, pred_mask, iou_thresh=0.25))
+#         oversampling_objects_50_list.append(oversampling_objects(mask, pred_mask, iou_thresh=0.5))
+#         oversampling_objects_75_list.append(oversampling_objects(mask,pred_mask, iou_thresh=0.75))
+#         coverage_list.append(coverage(mask, pred_mask))
+#         fp_rate_list.append(false_positive_rate(mask, pred_mask))
+#         amd_list.append(average_minimum_distance(mask, pred_mask))
+#         recall_list.append(pixel_recall(mask, pred_mask))
+#         precision_list.append(pixel_precision(mask, pred_mask))
+#         f1_list.append(pixel_f1(mask, pred_mask))
+#
+#     if empty_gt_total > 0:
+#         empty_gt_fp_rate = empty_gt_with_pred / empty_gt_total
+#     else:
+#         empty_gt_fp_rate = 0.0
+#
+#     if non_empty_gt_total > 0:
+#         non_empty_gt_fn_rate = non_empty_gt_without_pred / non_empty_gt_total
+#     else:
+#         non_empty_gt_fn_rate = 0.0
+#
+#     metrics = {
+#         "IoU": np.array(iou_list),
+#         "Dice": np.array(dice_list),
+#         "Hit0": np.array(hit_or_miss_0_list),
+#         "Hit1": np.array(hit_or_miss_1_list),
+#         "Hit25": np.array(hit_or_miss_25_list),
+#         "Hit5": np.array(hit_or_miss_5_list),
+#         "Hit75": np.array(hit_or_miss_75_list),
+#         "OversamplingObjects0": np.array(oversampling_objects_0_list),
+#         "OversamplingObjects1": np.array(oversampling_objects_1_list),
+#         "OversamplingObjects25": np.array(oversampling_objects_25_list),
+#         "OversamplingObjects50": np.array(oversampling_objects_50_list),
+#         "OversamplingObjects75": np.array(oversampling_objects_75_list),
+#         "Coverage": np.array(coverage_list),
+#         "FPRate": np.array(fp_rate_list),
+#         "AMD": np.array(amd_list),
+#         "PixelRecall": np.array(recall_list),
+#         "PixelPrecision": np.array(precision_list),
+#         "PixelF1": np.array(f1_list),
+#         "EmptyGT_FPRate": empty_gt_fp_rate,
+#         "NonEmptyGT_FNRate": non_empty_gt_fn_rate,
+#         "confusion_matrix_cls": cm if show_confusion_and_reports else None,
+#     }
+#
+#     for mname in ["IoU", "Dice", "Coverage", "FPRate", "AMD", "PixelRecall", "PixelPrecision", "PixelF1",
+#                   "Hit0", "Hit1", "Hit25", "Hit5", "Hit75", "OversamplingObjects0", "OversamplingObjects1",
+#                   "OversamplingObjects25", "OversamplingObjects50", "OversamplingObjects75"]:
+#         arr = metrics[mname]
+#         arr = arr[np.isfinite(arr)]
+#         if arr.size == 0:
+#             print(f"{mname}: sin datos finitos (NaN/Inf).")
+#             continue
+#         print(
+#             f"{mname}: media={arr.mean():.4f}, mediana={np.median(arr):.4f}, p90={np.percentile(arr, 90):.4f}, p95={np.percentile(arr, 95):.4f}"
+#         )
+#
+#     has_gt = np.array(has_gt_list, dtype=bool)
+#     print("\nMétricas por subconjunto (with_gt / no_gt)")
+#     per_image_metrics = {k: v for k, v in metrics.items() if isinstance(v, (np.ndarray, list, tuple)) and k != "confusion_matrix_cls"}
+#     summary_by_gt = _print_subset_summaries(per_image_metrics, has_gt)
+#
+#     print("Images-level metrics")
+#     print(f"Empty GT with positives detections: {empty_gt_fp_rate:.4f}, Non-empty GT with no detections: {non_empty_gt_fn_rate:.4f}")
+#     metrics["has_gt"] = has_gt
+#     metrics["summary_by_gt"] = summary_by_gt
+#     return metrics
 def inference_and_test_metrics(
     model,
     test_loader,
@@ -129,21 +398,21 @@ def inference_and_test_metrics(
     postprocess_min_area=100,
     postprocess_apply_opening=True,
     postprocess_opening_iter=2,
-    params=None  # Parámetros de normalización (mean, std) para denormalizar imágenes
+    params=None,
+    # NUEVO: umbrales arbitrarios para hit y oversampling (por defecto incluye 0.15)
+    hit_iou_thresholds: Iterable[float] = (0.0, 0.1, 0.15, 0.25, 0.5, 0.75),
+    oversampling_iou_thresholds: Iterable[float] = (0.0, 0.1, 0.15, 0.25, 0.5, 0.75),
 ):
-    """
-    Extensión: aplica "gate" con la cabeza de clasificación y post-procesado de componentes para
-    reducir falsos positivos manteniendo buen hit-or-miss.
-    """
-    # load_state_dict_forgiving(model, state_dict_path, map_location=device, strict=False)
-    model.load_state_dict(torch.load(state_dict_path, map_location=device))
+    if state_dict_path is not None:
+        load_state_dict_forgiving(model, state_dict_path, map_location=device, strict=False)
     model.eval()
+
     all_test_true_masks = []
     all_test_pred_probs = []
     all_test_pred_bin = []
     all_preds_cls, all_labels_cls = [], []
 
-    # Directorio de visualizaciones
+    # Visualizaciones
     if save_visuals:
         if viz_out_dir is None:
             safe_tag = viz_tag if viz_tag else "viz"
@@ -152,10 +421,8 @@ def inference_and_test_metrics(
                 f"viz_element_{element_index}_{safe_tag}_thr{threshold:.2f}_cls{best_threshold_cls_saved:.2f}"
             )
         os.makedirs(viz_out_dir, exist_ok=True)
-
     dataset = getattr(test_loader, "dataset", None)
-    sample_counter = 0
-    saved = 0
+    sample_counter, saved = 0, 0
 
     with torch.no_grad():
         for images, masks, labels in test_loader:
@@ -164,7 +431,6 @@ def inference_and_test_metrics(
 
             probs_cls = torch.sigmoid(cls_out)  # (B,1)
             preds_cls = (probs_cls > best_threshold_cls_saved).float()
-
             all_preds_cls.extend(preds_cls.cpu().numpy())
             all_labels_cls.extend(labels.cpu().numpy())
             all_test_true_masks.extend(masks[:,0].cpu().numpy())
@@ -177,7 +443,7 @@ def inference_and_test_metrics(
                 prob = probs_seg[b, 0]
                 cls_p = float(probs_cls[b, 0].item())
 
-                # Gate: si la prob de clase no supera el umbral, anula la máscara
+                # Gate de clasificación
                 if cls_p <= float(best_threshold_cls_saved):
                     pred_bin = np.zeros_like(prob, dtype=np.float32)
                 else:
@@ -217,61 +483,52 @@ def inference_and_test_metrics(
                     saved += 1
                 sample_counter += 1
 
-    # Para clasificación
+    # Clasificación
     all_preds_cls = [int(p[0]) for p in all_preds_cls]
     all_labels_cls = [int(l[0]) for l in all_labels_cls]
-
     if show_confusion_and_reports:
         cm = confusion_matrix(all_labels_cls, all_preds_cls, normalize='true')
-        if save_visuals:
-            disp = ConfusionMatrixDisplay(cm, display_labels=[f"No Element {element_index}", f"Element {element_index}"])
-            disp.plot(cmap="Blues")
-            plt.title("Matriz de Confusión - Clasificación Test (con gate)")
-            plt.show()
-            print("Reporte de clasificación en Test (con gate):")
-            print(classification_report(all_labels_cls, all_preds_cls,
-                                        target_names=[f"No Element {element_index}", f"Element {element_index}"]))
+        # Si dibujas: ConfusionMatrixDisplay(cm, ...).plot(cmap="Blues")
+    else:
+        cm = None
 
-    # Métricas de segmentación con máscara post-procesada
+    # Métricas de segmentación por imagen
     iou_list, dice_list, amd_list = [], [], []
-    hit_or_miss_0_list, hit_or_miss_1_list = [], []
-    hit_or_miss_25_list, hit_or_miss_5_list, hit_or_miss_75_list = [], [], []
-    oversampling_objects_0_list, oversampling_objects_1_list = [], []
-    oversampling_objects_25_list, oversampling_objects_50_list, oversampling_objects_75_list = [], [], []
     coverage_list, fp_rate_list = [], []
     recall_list, precision_list, f1_list = [], [], []
-    empty_gt_total = 0
-    empty_gt_with_pred = 0
-    non_empty_gt_without_pred = 0
-    non_empty_gt_total = 0
+
+    # Colecciones dinámicas
+    hit_lists: Dict[float, list] = {float(t): [] for t in hit_iou_thresholds}
+    over_lists: Dict[float, list] = {float(t): [] for t in oversampling_iou_thresholds}
+
+    empty_gt_total = empty_gt_with_pred = 0
+    non_empty_gt_total = non_empty_gt_without_pred = 0
+    has_gt_list = []
+
     for mask, pred_mask, prob in zip(all_test_true_masks, all_test_pred_bin, all_test_pred_probs):
-        if mask.sum() == 0: # Gt vacio
+        has_gt = (mask.sum() > 0)
+        has_gt_list.append(has_gt)
+        if not has_gt:
             empty_gt_total += 1
             if pred_mask.sum() > 0:
                 empty_gt_with_pred += 1
         else:
             non_empty_gt_total += 1
-            if pred_mask.sum() == 0: # Gt no vacio, pred vacio
+            if pred_mask.sum() == 0:
                 non_empty_gt_without_pred += 1
-
-
 
         intersection = (pred_mask * mask).sum()
         union = ((pred_mask + mask) > 0).sum()
         iou = intersection / (union + 1e-8)
         iou_list.append(iou)
-        dice = 2 * intersection / (pred_mask.sum() + mask.sum() + 1e-8)
-        dice_list.append(dice)
-        hit_or_miss_0_list.append(hit_or_miss_iou(mask, pred_mask, iou_thresh=0.0))
-        hit_or_miss_1_list.append(hit_or_miss_iou(mask, pred_mask, iou_thresh=0.1))
-        hit_or_miss_25_list.append(hit_or_miss_iou(mask, pred_mask, iou_thresh=0.25))
-        hit_or_miss_5_list.append(hit_or_miss_iou(mask, pred_mask, iou_thresh=0.5))
-        hit_or_miss_75_list.append(hit_or_miss_iou(mask, pred_mask, iou_thresh=0.75))
-        oversampling_objects_0_list.append(oversampling_objects(mask, pred_mask, iou_thresh=0.0))
-        oversampling_objects_1_list.append(oversampling_objects(mask, pred_mask, iou_thresh=0.1))
-        oversampling_objects_25_list.append(oversampling_objects(mask, pred_mask, iou_thresh=0.25))
-        oversampling_objects_50_list.append(oversampling_objects(mask, pred_mask, iou_thresh=0.5))
-        oversampling_objects_75_list.append(oversampling_objects(mask,pred_mask, iou_thresh=0.75))
+        dice_list.append(2 * intersection / (pred_mask.sum() + mask.sum() + 1e-8))
+
+        # Hit/Oversampling con umbrales arbitrarios
+        for t in hit_lists.keys():
+            hit_lists[t].append(hit_or_miss_iou(mask, pred_mask, iou_thresh=float(t)))
+        for t in over_lists.keys():
+            over_lists[t].append(oversampling_objects(mask, pred_mask, iou_thresh=float(t)))
+
         coverage_list.append(coverage(mask, pred_mask))
         fp_rate_list.append(false_positive_rate(mask, pred_mask))
         amd_list.append(average_minimum_distance(mask, pred_mask))
@@ -279,29 +536,12 @@ def inference_and_test_metrics(
         precision_list.append(pixel_precision(mask, pred_mask))
         f1_list.append(pixel_f1(mask, pred_mask))
 
-    if empty_gt_total > 0:
-        empty_gt_fp_rate = empty_gt_with_pred / empty_gt_total
-    else:
-        empty_gt_fp_rate = 0.0
+    empty_gt_fp_rate = (empty_gt_with_pred / empty_gt_total) if empty_gt_total > 0 else 0.0
+    non_empty_gt_fn_rate = (non_empty_gt_without_pred / non_empty_gt_total) if non_empty_gt_total > 0 else 0.0
 
-    if non_empty_gt_total > 0:
-        non_empty_gt_fn_rate = non_empty_gt_without_pred / non_empty_gt_total
-    else:
-        non_empty_gt_fn_rate = 0.0
-
-    metrics = {
+    metrics: Dict[str, Any] = {
         "IoU": np.array(iou_list),
         "Dice": np.array(dice_list),
-        "Hit0": np.array(hit_or_miss_0_list),
-        "Hit1": np.array(hit_or_miss_1_list),
-        "Hit25": np.array(hit_or_miss_25_list),
-        "Hit5": np.array(hit_or_miss_5_list),
-        "Hit75": np.array(hit_or_miss_75_list),
-        "OversamplingObjects0": np.array(oversampling_objects_0_list),
-        "OversamplingObjects1": np.array(oversampling_objects_1_list),
-        "OversamplingObjects25": np.array(oversampling_objects_25_list),
-        "OversamplingObjects50": np.array(oversampling_objects_50_list),
-        "OversamplingObjects75": np.array(oversampling_objects_75_list),
         "Coverage": np.array(coverage_list),
         "FPRate": np.array(fp_rate_list),
         "AMD": np.array(amd_list),
@@ -310,20 +550,31 @@ def inference_and_test_metrics(
         "PixelF1": np.array(f1_list),
         "EmptyGT_FPRate": empty_gt_fp_rate,
         "NonEmptyGT_FNRate": non_empty_gt_fn_rate,
-        "confusion_matrix_cls": cm if show_confusion_and_reports else None,
+        "confusion_matrix_cls": cm,
     }
+    # Nombres legibles: Hit15, OversamplingObjects15, etc.
+    for t, lst in hit_lists.items():
+        metrics[f"Hit{int(round(t*100))}"] = np.array(lst)
+    for t, lst in over_lists.items():
+        metrics[f"OversamplingObjects{int(round(t*100))}"] = np.array(lst)
 
-    for mname in ["IoU", "Dice", "Coverage", "FPRate", "AMD", "PixelRecall", "PixelPrecision", "PixelF1",
-                  "Hit0", "Hit1", "Hit25", "Hit5", "Hit75", "OversamplingObjects0", "OversamplingObjects1",
-                  "OversamplingObjects25", "OversamplingObjects50", "OversamplingObjects75"]:
-        arr = metrics[mname]
-        arr = arr[np.isfinite(arr)]
+    # Resumen general
+    keys_for_summary = [k for k, v in metrics.items() if isinstance(v, (np.ndarray, list, tuple))]
+    for mname in keys_for_summary:
+        arr = np.asarray(metrics[mname]); arr = arr[np.isfinite(arr)]
         if arr.size == 0:
-            print(f"{mname}: sin datos finitos (NaN/Inf).")
-            continue
-        print(
-            f"{mname}: media={arr.mean():.4f}, mediana={np.median(arr):.4f}, p90={np.percentile(arr, 90):.4f}, p95={np.percentile(arr, 95):.4f}"
-        )
+            print(f"{mname}: sin datos finitos (NaN/Inf)."); continue
+        print(f"{mname}: media={arr.mean():.4f}, mediana={np.median(arr):.4f}, p90={np.percentile(arr, 90):.4f}, p95={np.percentile(arr, 95):.4f}")
+
+    # Separación con/sin GT
+    has_gt = np.array(has_gt_list, dtype=bool)
+    print("\nMétricas por subconjunto (with_gt / no_gt)")
+    per_image_metrics = {k: v for k, v in metrics.items() if isinstance(v, (np.ndarray, list, tuple)) and k != "confusion_matrix_cls"}
+    summary_by_gt = _print_subset_summaries(per_image_metrics, has_gt)
+
     print("Images-level metrics")
     print(f"Empty GT with positives detections: {empty_gt_fp_rate:.4f}, Non-empty GT with no detections: {non_empty_gt_fn_rate:.4f}")
+
+    metrics["has_gt"] = has_gt
+    metrics["summary_by_gt"] = summary_by_gt
     return metrics

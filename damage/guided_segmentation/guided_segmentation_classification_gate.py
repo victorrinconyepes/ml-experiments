@@ -35,24 +35,24 @@ from damage.guided_segmentation.utils import inference_and_test_metrics
 IMAGE_DIR = "/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/cropped_images/"
 MASK_DIR = "/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/cropped_masks"
 # CSV_PATH = "/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/crop_damage_classes.csv"
-SPLIT_DIR = "/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/split/element_4"
+ELEMENT_INDEX = "7"
+SPLIT_DIR = f"/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/split/element_{ELEMENT_INDEX}"
 
 BATCH_SIZE = 16
 NUM_EPOCHS = 30
 LR = 1e-5
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-ELEMENT_INDEX = "4"  # Seguir probando con "7"
 NUM_WORKERS = 16
 WEIGHT_DECAY = 1e-5
 EARLY_STOP_PATIENCE = 7
 IMAGE_SIZE = 320
 classification_loss_weight = 0.1
 
-jira_ticket = "COPPER-2359"
+jira_ticket = "COPPER-2391"
 MLFLOW_RUN_NAME = f"GaussianDiceLoss(kernel_size=7, sigma=2, smooth=1e-6)) + {classification_loss_weight} * WeightedBCE/AdamW/Enc1e-5Dec+Cls1e-4/DualUNetPlusPlusGuided/efficientnet-b0"
+REMOVE_GRAYSKY = True
 
-
-BEST_MODEL_DIR = f"/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/test_guided_segmentation_element_{ELEMENT_INDEX}/fix"
+BEST_MODEL_DIR = f"/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/test_guided_segmentation_element_{ELEMENT_INDEX}/fix/only-bluesky"
 os.makedirs(BEST_MODEL_DIR, exist_ok=True)
 BEST_MODEL_PATH = os.path.join(BEST_MODEL_DIR, f"best_model_element_{ELEMENT_INDEX}.pth")
 backbone = 'efficientnet-b0'
@@ -198,7 +198,7 @@ def main():
     # df_neg = df[df[ELEMENT_INDEX] == False]
     # df_neg_sampled = df_neg.sample(n=int(len(df_pos)*2), random_state=42)
     # df_balanced = pd.concat([df_pos, df_neg_sampled]).sample(frac=1, random_state=42)
-
+    #
     # df_trainval, df_test = train_test_split(
     #     df_balanced, test_size=0.2, random_state=42, stratify=df_balanced[ELEMENT_INDEX]
     # )
@@ -208,6 +208,12 @@ def main():
     df_train = pd.read_csv(os.path.join(SPLIT_DIR, 'train.csv'))
     df_val = pd.read_csv(os.path.join(SPLIT_DIR, 'val.csv'))
     df_test = pd.read_csv(os.path.join(SPLIT_DIR, 'test.csv'))
+
+    #Remove graysky
+    if REMOVE_GRAYSKY:
+        df_train = df_train[~df_train['image_name'].str.contains('graysky', na=False)]
+        df_val = df_val[~df_val['image_name'].str.contains('graysky', na=False)]
+        df_test = df_test[~df_test['image_name'].str.contains('graysky', na=False)]
 
     train_dataset = CSVCroppedImagesDataset(df_train, IMAGE_DIR, MASK_DIR, transform=train_transform, element_index=ELEMENT_INDEX)
     val_dataset = CSVCroppedImagesDataset(df_val, IMAGE_DIR, MASK_DIR, transform=val_transform, element_index=ELEMENT_INDEX)

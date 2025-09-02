@@ -1,6 +1,7 @@
 import segmentation_models_pytorch as smp
 import albumentations as A
 from albumentations import ToTensorV2
+from torch.ao.nn.quantized.functional import threshold
 
 from damage.datasets.dataset import CSVCroppedImagesDataset
 from damage.guided_segmentation.models import DualUNetPlusPlusGuided
@@ -11,6 +12,9 @@ import pandas as pd
 import os
 from torch.utils.data import DataLoader
 import mlflow
+from mlflow.artifacts import download_artifacts
+from urllib.parse import quote
+from pyvexcelutils.aws.secrets import Secrets
 
 IMAGE_SIZE = 320
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -18,25 +22,54 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Rutas (ajusta a tu entorno)
 IMAGE_DIR = "/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/cropped_images/"
 MASK_DIR = "/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/cropped_masks"
-CSV_INFERENCE_PATH = "/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/split/element_4/test.csv"
+
+ELEMENT_INDEX = "7"
+CSV_INFERENCE_PATH = f"/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/split/element_{ELEMENT_INDEX}/test.csv"
 # STATE_DICT_PATH = "/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/test_guided_segmentation_element_4/fix/best_model_element_4.pth"
 # BEST_MODEL_DIR = f"/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/test_guided_segmentation_element_4/fix"
-
-# Elemento que estás segmentando/clasificando
-ELEMENT_INDEX = "4"
 
 IMAGE_SIZE = 320
 BATCH_SIZE = 8
 NUM_WORKERS = 8
 
 BACKBONE = 'efficientnet-b0'
+
+ARTIFACT_URI = (
+    "mlflow-artifacts:/property-damage/guided-segmentation-by-classification/binary/"
+    "4d0634f9cf924a98a0e66659ebb47d04/artifacts/checkpoints/best_model_element_7.pth"
+)
+
+def resolve_mlflow_artifact(artifact_uri: str) -> str:
+    """
+    Resuelve un artifact_uri de MLflow a una ruta local descargándolo.
+    Configura el tracking URI y credenciales desde Secrets().
+    """
+    username, password, url = Secrets().get_mlflow_user()
+
+    # Opción 1 (recomendada): credenciales por variables de entorno
+    os.environ["MLFLOW_TRACKING_USERNAME"] = username
+    os.environ["MLFLOW_TRACKING_PASSWORD"] = password
+    mlflow.set_tracking_uri(url)
+
+    # Opción 2 (alternativa): embebido en URL (no necesario si usas Opción 1)
+    _ = quote(username, safe="")
+    _ = quote(password, safe="")
+
+    local_path = download_artifacts(artifact_uri=artifact_uri)
+    if not os.path.exists(local_path):
+        raise FileNotFoundError(f"No se pudo descargar el artifact desde {artifact_uri}")
+    print(f"Checkpoint descargado en: {local_path}")
+    return local_path
+
+
 def main():
     params = smp.encoders.get_preprocessing_params(BACKBONE)
-    transform =  A.Compose([
+    transform = A.Compose([
         A.Resize(IMAGE_SIZE, IMAGE_SIZE),
         A.Normalize(mean=params['mean'], std=params['std']),
         ToTensorV2()
     ])
+
     df = pd.read_csv(CSV_INFERENCE_PATH)
     df_pos = df[df[ELEMENT_INDEX] == True].reset_index(drop=True)
     print(f"Total test={len(df)}, solo positivos={len(df_pos)}")
@@ -48,19 +81,19 @@ def main():
         test_dataset, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=NUM_WORKERS, pin_memory=True
     )
+
     model = DualUNetPlusPlusGuided(
         backbone_name=BACKBONE, pretrained=True, in_channels=3, seg_classes=1, cls_classes=1
     ).to(DEVICE)
 
+    # Descarga el checkpoint desde MLflow y úsalo en inference
+    STATE_DICT_PATH = resolve_mlflow_artifact(ARTIFACT_URI)
 
-    # Umbrales óptimos obtenidos en validación
-    # Umbrales
-    # Por ejemplo, los "precision-first":
-    BEST_THRESHOLD_CLS_PREC_SAVED = 0.86  # Cls(gate)
-    BEST_THRESHOLD_PIX_PREC_SAVED = 0.7  # PixelPrecision
-
-    threshols_cls = [0.5, 0.6, 0.7, 0.8, 0.86, 0.9]
-    threshols_pix = [0.5, 0.6, 0.7, 0.8, 0.9]
+    # Umbrales a explorar
+    # threshols_cls = [0.5, 0.6, 0.7, 0.8, 0.86, 0.9]
+    # threshols_pix = [0.5, 0.6, 0.7, 0.8, 0.9]
+    threshols_cls = [0.6]
+    threshols_pix = [0.4]
 
     # Post-procesado
     POSTPROCESSING = False
@@ -68,26 +101,30 @@ def main():
     POST_MIN_AREA = 64
     POST_APPLY_OPENING = False
     POST_OPENING_ITER = 1
-    SAVE_DIR = (f"/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/"
-                f"test_guided_segmentation_element_4/fix/inference_outputs_element_{ELEMENT_INDEX}/testthreshold_pixprec")
+
+    SAVE_DIR = (
+        "/ceph04/ml/property_damage_elements/datasets/"
+        "ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/"
+        f"test_guided_segmentation_element_{ELEMENT_INDEX}/fix/"
+        f"inference_outputs_element_{ELEMENT_INDEX}/{ARTIFACT_URI.split('/')[-4]}"
+    )
     os.makedirs(SAVE_DIR, exist_ok=True)
 
-    SAVE_VISUALS = False
-
+    SAVE_VISUALS = True
 
     for thr_pixel_precision in threshols_pix:
         for thr_cls in threshols_cls:
-            print(f"Testing {thr_pixel_precision} pixel precision - {thr_cls} cls")
+            print(f"Testing PixelPrecision thr={thr_pixel_precision} - Cls thr={thr_cls}")
             metrics = inference_and_test_metrics(
                 model=model,
                 test_loader=test_loader,
                 best_threshold_cls_saved=thr_cls,
                 threshold=thr_pixel_precision,
                 save_visuals=SAVE_VISUALS,
-                viz_limit=100,
+                viz_limit=300,
                 viz_tag="pix_prec_opt",
                 postprocess=POSTPROCESSING,
-                state_dict_path=STATE_DICT_PATH,   # IMPORTANTE: aquí cargas los pesos
+                state_dict_path=STATE_DICT_PATH,   # Checkpoint descargado de MLflow
                 device=DEVICE,
                 element_index=ELEMENT_INDEX,
                 save_dir=SAVE_DIR,
@@ -97,8 +134,6 @@ def main():
                 postprocess_opening_iter=POST_OPENING_ITER,
                 params=params,  # Para denormalizar imágenes en los paneles
             )
-
-
 
 
 if __name__ == '__main__':

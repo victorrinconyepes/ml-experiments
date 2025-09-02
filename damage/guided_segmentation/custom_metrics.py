@@ -1,18 +1,3 @@
-"""
-Custom metrics and threshold selection utilities for guided segmentation workflows.
-
-This module provides:
-- Pixel-wise segmentation metrics (IoU, Dice, precision, recall, F1) for PyTorch tensors and NumPy masks.
-- Image/component-level utilities (hit-or-miss by IoU, oversampling objects, coverage, false positive rate).
-- Distance-based metric (average minimum distance) between binary masks.
-- Threshold selection helpers based on PR curves: optimal by F1, target precision, and IoU sweep.
-
-Conventions
-- Torch tensors for model outputs are expected in shape (B, C, H, W) with C=1 for binary segmentation.
-- When logits=True, functions apply sigmoid before thresholding.
-- NumPy mask arrays are expected as binary (0/1 or bool) with shape (H, W).
-"""
-
 import numpy as np
 import torch
 from sklearn.metrics import precision_recall_curve
