@@ -35,8 +35,7 @@ NUM_WORKERS = 8
 BACKBONE = 'efficientnet-b0'
 
 ARTIFACT_URI = (
-    "mlflow-artifacts:/property-damage/guided-segmentation-by-classification/binary/"
-    "4d0634f9cf924a98a0e66659ebb47d04/artifacts/checkpoints/best_model_element_7.pth"
+    "mlflow-artifacts:/property-damage/guided-segmentation-by-classification/binary/f524ee3e93774ed398181f29f80c8ad3/artifacts/checkpoints/best_model_element_7.pth"
 )
 
 def resolve_mlflow_artifact(artifact_uri: str) -> str:
@@ -93,7 +92,7 @@ def main():
     # threshols_cls = [0.5, 0.6, 0.7, 0.8, 0.86, 0.9]
     # threshols_pix = [0.5, 0.6, 0.7, 0.8, 0.9]
     threshols_cls = [0.6]
-    threshols_pix = [0.4]
+    threshols_pix = [0.3]
 
     # Post-procesado
     POSTPROCESSING = False
@@ -106,7 +105,7 @@ def main():
         "/ceph04/ml/property_damage_elements/datasets/"
         "ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/"
         f"test_guided_segmentation_element_{ELEMENT_INDEX}/fix/"
-        f"inference_outputs_element_{ELEMENT_INDEX}/{ARTIFACT_URI.split('/')[-4]}"
+        f"inference_outputs_element_{ELEMENT_INDEX}/{ARTIFACT_URI.split('/')[-4]}/transformaciones/"
     )
     os.makedirs(SAVE_DIR, exist_ok=True)
 

@@ -30,8 +30,7 @@ CSV_TEST = f"/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classe
 
 # Checkpoint en MLflow
 ARTIFACT_URI = (
-    "mlflow-artifacts:/property-damage/guided-segmentation-by-classification/binary/"
-    "4d0634f9cf924a98a0e66659ebb47d04/artifacts/checkpoints/best_model_element_7.pth"
+    "mlflow-artifacts:/property-damage/guided-segmentation-by-classification/binary/f524ee3e93774ed398181f29f80c8ad3/artifacts/checkpoints/best_model_element_7.pth"
 )
 
 # Malla de thresholds
@@ -45,6 +44,7 @@ BETA_FPR_NO_GT = 0.2    # penalización de FPR en no-GT
 # Restricción (opcional): filtra configuraciones con oversampling50_with_gt_mean <= este valor
 MAX_OVERSAMP50_MEAN = 0.6
 
+AVOID_GRAYSKY = False
 SAVE_CSV = f"./grid_search_element_{ELEMENT_INDEX}.csv"
 
 def resolve_mlflow_artifact(artifact_uri: str) -> str:
@@ -67,6 +67,8 @@ def main():
         ToTensorV2()
     ])
     df_test = pd.read_csv(CSV_TEST)
+    if AVOID_GRAYSKY:
+        df_test = df_test[~df_test['image_name'].str.contains('graysky', na=False)]
     test_dataset = CSVCroppedImagesDataset(df_test, IMAGE_DIR, MASK_DIR, transform=transform, element_index=ELEMENT_INDEX)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 

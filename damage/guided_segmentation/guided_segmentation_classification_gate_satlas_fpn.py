@@ -26,9 +26,8 @@ from pyvexcelutils.mlflow.mlflow_helper import setup_mlflow, MLFlowNamer
 from damage.datasets.dataset import CSVCroppedImagesDataset
 from damage.guided_segmentation.custom_metrics import iou_score, dice_score, seg_precision_recall, \
     find_optimal_threshold, find_optimal_iou_threshold, pick_threshold_for_precision, find_optimal_pixel_f1_threshold
-from damage.guided_segmentation.models import DualUNetPlusPlusGuided
+from damage.guided_segmentation.models import DualUNetPlusPlusGuided, DualSatlasFPNGuided
 from damage.guided_segmentation.utils import inference_and_test_metrics
-import cv2
 
 # ===========================
 # Parámetros
@@ -49,14 +48,18 @@ EARLY_STOP_PATIENCE = 7
 IMAGE_SIZE = 320
 classification_loss_weight = 0.1
 
-jira_ticket = "COPPER-2361"
-MLFLOW_RUN_NAME = f"GaussianDiceLoss(kernel_size=7, sigma=2, smooth=1e-6)) + {classification_loss_weight} * WeightedBCE/AdamW/Enc1e-5Dec+Cls1e-4/DualUNetPlusPlusGuided/efficientnet-b0"
+jira_ticket = "COPPER-2392"
+SATLAS_MODEL_ID = "Sentinel2_Resnet50_SI_RGB"  # elige el checkpoint acorde a tus canales y dominio
+FREEZE_BACKBONE = False
+model_tag = f"Satlas[{SATLAS_MODEL_ID}]"
+MLFLOW_RUN_NAME = f"{model_tag}/GaussianDiceLoss(kernel_size=7, sigma=2, smooth=1e-6)) + {classification_loss_weight} * WeightedBCE/AdamW/EncFrozen/DualSatlasFPNGuided/{SATLAS_MODEL_ID}"
+
 REMOVE_GRAYSKY = False
 
-BEST_MODEL_DIR = f"/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/test_guided_segmentation_element_{ELEMENT_INDEX}/fix"
+BEST_MODEL_DIR = f"/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/test_guided_segmentation_element_{ELEMENT_INDEX}/fix/only-bluesky"
 os.makedirs(BEST_MODEL_DIR, exist_ok=True)
 BEST_MODEL_PATH = os.path.join(BEST_MODEL_DIR, f"best_model_element_{ELEMENT_INDEX}.pth")
-backbone = 'efficientnet-b0'
+
 
 # menos FP manteniendo buen hit-or-miss
 TARGET_PIXEL_PRECISION = 0.65        # precisión-píxel deseada para elegir umbral de segmentación
@@ -68,50 +71,22 @@ MIN_COMPONENT_AREA = 64              # área mínima de componente (px)
 APPLY_BINARY_OPENING = False         # aplicar apertura binaria para reducir ruido fino
 OPENING_ITER = 1
 
-
 # ===========================
 # Transformaciones
 # ===========================
-params = smp.encoders.get_preprocessing_params(backbone)
-# train_transform = A.Compose([
-#     A.Resize(IMAGE_SIZE, IMAGE_SIZE),
-#     A.HorizontalFlip(p=0.5),
-#     A.VerticalFlip(p=0.5),
-#     A.Rotate(limit=30, p=0.5),
-#     A.ColorJitter(brightness=0.4, contrast=0.432, saturation=0.4, hue=0.1, p=0.5),
-#     A.Normalize(mean=params['mean'], std=params['std']),
-#     ToTensorV2()
-# ])
-# val_transform = A.Compose([
-#     A.Resize(IMAGE_SIZE, IMAGE_SIZE),
-#     A.Normalize(mean=params['mean'], std=params['std']),
-#     ToTensorV2()
-# ])
+params = {'mean': [0.0, 0.0, 0.0], 'std': [1.0, 1.0, 1.0]} #todo
 train_transform = A.Compose([
-    A.SmallestMaxSize(max_size=IMAGE_SIZE, interpolation=cv2.INTER_LINEAR),
-    A.PadIfNeeded(min_height=IMAGE_SIZE, min_width=IMAGE_SIZE,
-                  border_mode=cv2.BORDER_REFLECT_101),
-
-    A.RandomCrop(height=IMAGE_SIZE, width=IMAGE_SIZE),
-
+    A.Resize(IMAGE_SIZE, IMAGE_SIZE),
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.5),
-    A.Rotate(limit=10, border_mode=cv2.BORDER_REFLECT_101,
-             interpolation=cv2.INTER_LINEAR, p=0.5),
-
-    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-    A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=10, val_shift_limit=10, p=0.3),
-    A.Sharpen(alpha=(0.05, 0.2), lightness=(0.9, 1.1), p=0.2),
-
-    A.Normalize(mean=params['mean'], std=params['std']),
+    A.Rotate(limit=30, p=0.5),
+    A.ColorJitter(brightness=0.4, contrast=0.432, saturation=0.4, hue=0.1, p=0.5),
+    A.ToFloat(max_value=255.0),  # escala a [0,1]
     ToTensorV2()
 ])
 val_transform = A.Compose([
-    A.SmallestMaxSize(max_size=IMAGE_SIZE, interpolation=cv2.INTER_LINEAR),
-    A.PadIfNeeded(min_height=IMAGE_SIZE, min_width=IMAGE_SIZE,
-                  border_mode=cv2.BORDER_REFLECT_101),
-    A.CenterCrop(height=IMAGE_SIZE, width=IMAGE_SIZE),
-    A.Normalize(mean=params['mean'], std=params['std']),
+    A.Resize(IMAGE_SIZE, IMAGE_SIZE),
+    A.ToFloat(max_value=255.0),
     ToTensorV2()
 ])
 
@@ -254,7 +229,15 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True)
 
-    model = DualUNetPlusPlusGuided(backbone_name='efficientnet-b0', pretrained=True).to(DEVICE)
+    model = DualSatlasFPNGuided(
+        model_id=SATLAS_MODEL_ID,
+        seg_classes=1,
+        cls_classes=1,
+        use_spatial_attn=True,
+        use_film=True,
+        film_hidden=512,
+        freeze_backbone=FREEZE_BACKBONE,
+    ).to(DEVICE)
     model = torch.compile(model)
     torch.set_float32_matmul_precision('high')
 
@@ -268,15 +251,34 @@ def main():
     cls_loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([N_neg/N_pos], device=DEVICE))
 
     # OPTIMIZADOR
-    dec_params = list(model.decoder.parameters()) + list(model.segmentation_head.parameters())
-    cls_params = list(model.cls_fc.parameters())
-    enc_params = list(model.encoder.parameters())
+    param_groups = []
+    head_params = list(model.seg_head.parameters()) + list(model.cls_fc.parameters())
+    if getattr(model, "use_film", False):
+        head_params += list(model.film.parameters())
+    if getattr(model, "use_spatial_attn", False):
+        head_params += list(model.attn_gen.parameters())
+        head_params += list(model.ctx_proj.parameters())
 
-    optimizer = torch.optim.AdamW([
-        {"params": enc_params, "lr": 1e-5, "weight_decay": 1e-5},
-        {"params": dec_params + cls_params, "lr": 1e-4, "weight_decay": 1e-5},
-    ])
+    param_groups.append({"params": head_params, "lr": 1e-3, "weight_decay": WEIGHT_DECAY})
+
+    if not FREEZE_BACKBONE:
+        # Descongelado parcial recomendado: layer4 + FPN + Upsample
+        if hasattr(model.backbone_fpn, "fpn"):
+            param_groups.append(
+                {"params": model.backbone_fpn.fpn.parameters(), "lr": 1e-4, "weight_decay": WEIGHT_DECAY})
+        if hasattr(model.backbone_fpn, "upsample"):
+            param_groups.append(
+                {"params": model.backbone_fpn.upsample.parameters(), "lr": 1e-4, "weight_decay": WEIGHT_DECAY})
+        # ResNet layer4 (capas altas)
+        if hasattr(model.backbone_fpn, "backbone") and hasattr(model.backbone_fpn.backbone, "resnet"):
+            param_groups.append({"params": model.backbone_fpn.backbone.resnet.layer4.parameters(), "lr": 1e-4,
+                                 "weight_decay": WEIGHT_DECAY})
+
+
+
+    optimizer = torch.optim.AdamW(param_groups)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+
 
     metrics_history = {
         "train_loss": [], "val_loss": [], "val_iou": [], "val_dice": [], "val_prec_seg": [], "val_rec_seg": [],
@@ -318,7 +320,6 @@ def main():
             "early_stop_patience": EARLY_STOP_PATIENCE,
             "image_size": IMAGE_SIZE,
             "classification_loss_weight": classification_loss_weight,
-            "backbone": backbone,
             "target_pixel_precision": TARGET_PIXEL_PRECISION,
             "cls_gate_target_precision": CLS_GATE_TARGET_PRECISION,
             "keep_top_components": KEEP_TOP_COMPONENTS,
@@ -330,6 +331,9 @@ def main():
             "test_size": len(test_dataset),
             "cls_pos_weight": float(N_neg/N_pos),
             "seg_pos_weight": float(seg_pos_weight.item()) if seg_pos_weight is not None else None,
+            "encoder": model_tag,
+            "satlas_model_id": SATLAS_MODEL_ID,
+            "freeze_backbone": FREEZE_BACKBONE
         })
 
         for epoch in range(NUM_EPOCHS):
@@ -424,15 +428,15 @@ def main():
                 epochs_no_improve = 0
 
                 # Thresholds por distintas óptimas
-                # best_threshold, best_f1 = find_optimal_threshold(y_true_cls, y_probs_cls)  # clasificación por F1
-                # thr_f1, max_f1 = find_optimal_pixel_f1_threshold(all_val_true_masks, all_val_pred_probs)  # pixel-F1
-                # best_threshold_cls_saved = best_threshold
-                # best_threshold_iou_saved = best_threshold_iou
-                # best_threshold_f1_saved = thr_f1
+                best_threshold, best_f1 = find_optimal_threshold(y_true_cls, y_probs_cls)  # clasificación por F1
+                thr_f1, max_f1 = find_optimal_pixel_f1_threshold(all_val_true_masks, all_val_pred_probs)  # pixel-F1
+                best_threshold_cls_saved = best_threshold
+                best_threshold_iou_saved = best_threshold_iou
+                best_threshold_f1_saved = thr_f1
 
                 # Umbral por precisión-píxel objetivo (segmentación)
-                # y_true_pix = np.concatenate([m.ravel() for m in all_val_true_masks]).astype(np.uint8)
-                # y_prob_pix = np.concatenate([p.ravel() for p in all_val_pred_probs]).astype(np.float32)
+                y_true_pix = np.concatenate([m.ravel() for m in all_val_true_masks]).astype(np.uint8)
+                y_prob_pix = np.concatenate([p.ravel() for p in all_val_pred_probs]).astype(np.float32)
                 # best_threshold_pix_prec_saved = pick_threshold_for_precision(
                 #     y_true_pix, y_prob_pix, target_precision=TARGET_PIXEL_PRECISION
                 # )
@@ -443,24 +447,24 @@ def main():
                 # )
 
                 # Log best thresholds
-                # best_params = {
-                #     "best_threshold_cls_f1": float(best_threshold_cls_saved),
-                #     "best_threshold_iou": float(best_threshold_iou_saved),
-                #     "best_threshold_seg_f1": float(best_threshold_f1_saved),
-                #     "best_threshold_pix_precision": float(best_threshold_pix_prec_saved),
-                #     "best_threshold_cls_precision": float(best_threshold_cls_prec_saved),
-                #     "best_val_iou": float(best_val_iou)
-                # }
+                best_params = {
+                    "best_threshold_cls_f1": float(best_threshold_cls_saved),
+                    "best_threshold_iou": float(best_threshold_iou_saved),
+                    "best_threshold_seg_f1": float(best_threshold_f1_saved),
+                    "best_threshold_pix_precision": float(best_threshold_pix_prec_saved),
+                    "best_threshold_cls_precision": float(best_threshold_cls_prec_saved),
+                    "best_val_iou": float(best_val_iou)
+                }
 
                 # Log checkpoint artifact
                 if os.path.exists(BEST_MODEL_PATH):
                     mlflow.log_artifact(BEST_MODEL_PATH, artifact_path="checkpoints")
 
-                # print(f"✅ Mejor modelo guardado con Val IoU: {val_iou:.4f}, "
-                #       f"Best Thr Clasificación(F1): {best_threshold:.3f}, Best Thr IoU: {best_threshold_iou:.3f}, "
-                #       f"Best Thr Pixel-F1: {thr_f1:.3f}")
-                # print(f"🔧 Thresholds precisión: PixelPrecision={best_threshold_pix_prec_saved:.3f}, "
-                #       f"Cls(gate)={best_threshold_cls_prec_saved:.3f}")
+                print(f"✅ Mejor modelo guardado con Val IoU: {val_iou:.4f}, "
+                      f"Best Thr Clasificación(F1): {best_threshold:.3f}, Best Thr IoU: {best_threshold_iou:.3f}, "
+                      f"Best Thr Pixel-F1: {thr_f1:.3f}")
+                print(f"🔧 Thresholds precisión: PixelPrecision={best_threshold_pix_prec_saved:.3f}, "
+                      f"Cls(gate)={best_threshold_cls_prec_saved:.3f}")
             else:
                 epochs_no_improve += 1
 
@@ -504,7 +508,7 @@ def main():
         #     mlflow.log_metric(f"{mname}_median", float(median))
         #     mlflow.log_metric(f"{mname}_p90", float(p90))
         #     mlflow.log_metric(f"{mname}_p95", float(p95))
-        # Matriz de confusión clasificación
+        # # Matriz de confusión clasificación
         # cm = metrics['confusion_matrix_cls']
         # cm = np.round(cm, 2)
         # np.savetxt("confusion_matrix_cls.csv", cm, delimiter=",")
