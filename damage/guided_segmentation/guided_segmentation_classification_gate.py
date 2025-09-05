@@ -366,18 +366,23 @@ def main():
             metrics_history["train_cls_loss"].append(train_cls_loss_epoch)
 
             # Validación
+            # ===========================
+            # Bloque de validación
+            # ===========================
             model.eval()
             val_total_loss = 0.0
             val_seg_component = 0.0
             val_cls_component = 0.0
-            val_iou, val_dice, val_prec_seg, val_rec_seg = 0, 0, 0, 0
             y_true_cls, y_probs_cls = [], []
             all_val_true_masks = []
             all_val_pred_probs = []
 
             with torch.no_grad():
                 for images, masks, labels in val_loader:
-                    images, masks, labels = images.to(DEVICE), masks.to(DEVICE), labels.to(DEVICE).unsqueeze(1)
+                    images = images.to(DEVICE)
+                    masks = masks.to(DEVICE)
+                    labels = labels.to(DEVICE).unsqueeze(1)
+
                     seg_out, cls_out = model(images)
 
                     seg_loss = seg_loss_fn(seg_out, masks)
@@ -389,36 +394,43 @@ def main():
                     val_seg_component += seg_loss.item() * batch_size
                     val_cls_component += cls_loss.item() * batch_size
 
+                    # Guardar para métricas
                     y_true_cls.extend(labels.cpu().numpy())
                     y_probs_cls.extend(torch.sigmoid(cls_out).cpu().numpy())
-                    all_val_true_masks.append(masks)  # sin .cpu().numpy()
-                    all_val_pred_probs.append(torch.sigmoid(seg_out))  # sin .cpu().numpy()
+                    all_val_true_masks.append(masks)
+                    all_val_pred_probs.append(torch.sigmoid(seg_out))
 
-            all_val_true_masks = np.concatenate(all_val_true_masks, axis=0)
-            all_val_pred_probs = np.concatenate(all_val_pred_probs, axis=0)
+            # Convertir a CPU + NumPy antes de concatenar
+            all_val_true_masks_np = np.concatenate([m.cpu().numpy() for m in all_val_true_masks], axis=0)
+            all_val_pred_probs_np = np.concatenate([p.cpu().numpy() for p in all_val_pred_probs], axis=0)
+
+            # Calcular losses promedio
             n_val = len(val_loader.dataset)
             val_loss_epoch = val_total_loss / n_val
             val_seg_loss_epoch = val_seg_component / n_val
             val_cls_loss_epoch = val_cls_component / n_val
-            val_iou /= n_val
-            val_dice /= n_val
-            val_prec_seg /= n_val
-            val_rec_seg /= n_val
 
+            # Umbral óptimo para IoU
+            best_threshold_iou, _ = find_optimal_iou_threshold(all_val_true_masks_np, all_val_pred_probs_np)
+
+            # Predicciones binarias
+            preds = (all_val_pred_probs_np > best_threshold_iou).astype(np.float32)
+
+            # Métricas de segmentación
+            val_iou = iou_score(preds, all_val_true_masks_np)
+            val_dice = dice_score(preds, all_val_true_masks_np)
+            val_prec_seg, val_rec_seg = seg_precision_recall(preds, all_val_true_masks_np)
+
+            # Métricas de clasificación
             y_true_cls = np.array(y_true_cls).flatten()
             y_probs_cls = np.array(y_probs_cls).flatten()
             val_preds_cls = (y_probs_cls > best_threshold).astype(int)
+            val_acc_cls = accuracy_score(y_true_cls, val_preds_cls)
+            val_f1_cls = f1_score(y_true_cls, val_preds_cls)
+            val_roc_auc_cls = roc_auc_score(y_true_cls, y_probs_cls)
+            val_pr_auc_cls = average_precision_score(y_true_cls, y_probs_cls)
 
-            best_threshold_iou, _ = find_optimal_iou_threshold(all_val_true_masks, all_val_pred_probs)
-
-            all_val_true_masks = np.array(all_val_true_masks)
-            all_val_pred_probs = np.array(all_val_pred_probs)
-            preds = (all_val_pred_probs > best_threshold_iou).astype(np.float32)
-
-            val_iou = iou_score(preds, all_val_true_masks)
-            val_dice = dice_score(preds, all_val_true_masks)
-            val_prec_seg, val_rec_seg = seg_precision_recall(preds, all_val_true_masks)
-
+            # Guardar en history
             metrics_history["val_loss"].append(val_loss_epoch)
             metrics_history["val_seg_loss"].append(val_seg_loss_epoch)
             metrics_history["val_cls_loss"].append(val_cls_loss_epoch)
@@ -426,10 +438,10 @@ def main():
             metrics_history["val_dice"].append(val_dice)
             metrics_history["val_prec_seg"].append(val_prec_seg)
             metrics_history["val_rec_seg"].append(val_rec_seg)
-            metrics_history["val_acc_cls"].append(accuracy_score(y_true_cls, val_preds_cls))
-            metrics_history["val_f1_cls"].append(f1_score(y_true_cls, val_preds_cls))
-            metrics_history["val_roc_auc_cls"].append(roc_auc_score(y_true_cls, y_probs_cls))
-            metrics_history["val_pr_auc_cls"].append(average_precision_score(y_true_cls, y_probs_cls))
+            metrics_history["val_acc_cls"].append(val_acc_cls)
+            metrics_history["val_f1_cls"].append(val_f1_cls)
+            metrics_history["val_roc_auc_cls"].append(val_roc_auc_cls)
+            metrics_history["val_pr_auc_cls"].append(val_pr_auc_cls)
 
             # Log metrics per epoch
             mlflow.log_metric("train_loss", train_loss_epoch, step=epoch)
