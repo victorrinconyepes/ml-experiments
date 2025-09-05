@@ -95,10 +95,12 @@ class DualFPNGuided(nn.Module):
             encoder_name=backbone_name,
             encoder_weights='imagenet' if pretrained else None,
             in_channels=in_channels,
-            classes=seg_classes,
+            classes=seg_classes,      # número de clases de segmentación
             activation=None
         )
         self.encoder = self.seg_model.encoder
+        self.decoder = self.seg_model.decoder
+        self.segmentation_head = self.seg_model.segmentation_head
 
         c5 = self.encoder.out_channels[-1]
 
@@ -106,10 +108,11 @@ class DualFPNGuided(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.cls_fc = nn.Linear(c5, cls_classes)
 
-        # Salida final
+        # Descubrir canales del decoder
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, 256, 256)
-            dfeat = self.seg_model(dummy)
+            feats = self.encoder(dummy)
+            dfeat = self.decoder(feats)
             cdec = dfeat.shape[1]
         self.cdec = cdec
 
@@ -132,12 +135,9 @@ class DualFPNGuided(nn.Module):
             )
 
     def forward(self, x):
-        # features encoder
         feats = self.encoder(x)
         f5 = feats[-1]
-
-        # salida segmentación
-        dec = self.seg_model(x)  # FPN no tiene decoder explícito
+        dec = self.decoder(feats)   # features del decoder (antes de segmentation_head)
 
         # cls auxiliar
         cls_logits = self.cls_fc(self.global_pool(f5).flatten(1))
@@ -159,7 +159,9 @@ class DualFPNGuided(nn.Module):
             attn_map = self.attn_gen(attn_in)
             dec = dec * (1 + attn_map)
 
-        return dec, cls_logits
+        # logits de segmentación
+        seg_logits = self.segmentation_head(dec)
+        return seg_logits, cls_logits
 
 
 
