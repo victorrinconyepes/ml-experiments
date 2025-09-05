@@ -389,13 +389,6 @@ def main():
                     val_seg_component += seg_loss.item() * batch_size
                     val_cls_component += cls_loss.item() * batch_size
 
-
-                    val_iou += iou_score(seg_out, masks) * images.size(0)
-                    val_dice += dice_score(seg_out, masks) * images.size(0)
-                    prec, rec = seg_precision_recall(seg_out, masks)
-                    val_prec_seg += prec * images.size(0)
-                    val_rec_seg += rec * images.size(0)
-
                     y_true_cls.extend(labels.cpu().numpy())
                     y_probs_cls.extend(torch.sigmoid(cls_out).cpu().numpy())
                     all_val_true_masks.extend(masks.cpu().numpy())
@@ -410,14 +403,23 @@ def main():
             val_prec_seg /= n_val
             val_rec_seg /= n_val
 
-            metrics_history["val_loss"].append(val_loss_epoch)
-            metrics_history["val_seg_loss"].append(val_seg_loss_epoch)
-            metrics_history["val_cls_loss"].append(val_cls_loss_epoch)
-
             y_true_cls = np.array(y_true_cls).flatten()
             y_probs_cls = np.array(y_probs_cls).flatten()
             val_preds_cls = (y_probs_cls > best_threshold).astype(int)
 
+            best_threshold_iou, _ = find_optimal_iou_threshold(all_val_true_masks, all_val_pred_probs)
+
+            all_val_true_masks = np.array(all_val_true_masks)
+            all_val_pred_probs = np.array(all_val_pred_probs)
+            preds = (all_val_pred_probs > best_threshold_iou).astype(np.float32)
+
+            val_iou = iou_score(preds, all_val_true_masks)
+            val_dice = dice_score(preds, all_val_true_masks)
+            val_prec_seg, val_rec_seg = seg_precision_recall(preds, all_val_true_masks)
+
+            metrics_history["val_loss"].append(val_loss_epoch)
+            metrics_history["val_seg_loss"].append(val_seg_loss_epoch)
+            metrics_history["val_cls_loss"].append(val_cls_loss_epoch)
             metrics_history["val_iou"].append(val_iou)
             metrics_history["val_dice"].append(val_dice)
             metrics_history["val_prec_seg"].append(val_prec_seg)

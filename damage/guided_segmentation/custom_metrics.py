@@ -80,30 +80,30 @@ def find_optimal_threshold(y_true, y_probs):
     best_idx = np.argmax(f1_scores)
     return thresholds[best_idx], f1_scores[best_idx]
 
-def find_optimal_iou_threshold(y_true_masks, y_pred_probs):
-    """Sweep thresholds in [0,1] to maximize mean IoU across samples.
-
-    Parameters
-    - y_true_masks: list/iterable of NumPy arrays (H,W), binary GT masks.
-    - y_pred_probs: list/iterable of NumPy arrays (H,W), predicted probabilities in [0,1].
-
-    Returns
-    - (best_thr, best_mean_iou): best threshold and corresponding mean IoU.
+def find_optimal_iou_threshold(y_true, y_pred, thresholds=np.linspace(0.1, 0.9, 9)):
     """
-    thresholds = np.linspace(0, 1, 50)
-    mean_ious = []
-    for th in thresholds:
-        ious = []
-        for yt, yp in zip(y_true_masks, y_pred_probs):
-            pred = (yp > th).astype(np.float32)
-            intersection = (pred * yt).sum()
-            union = ((pred + yt) > 0).sum()
-            iou = intersection / (union + 1e-8)
-            ious.append(iou)
-        mean_ious.append(np.mean(ious))
-    best_th = thresholds[np.argmax(mean_ious)]
-    best_iou = np.max(mean_ious)
-    return best_th, best_iou
+    Encuentra el threshold que maximiza IoU dado un batch completo.
+    - y_true: tensor (B, 1, H, W) ground truth binario.
+    - y_pred: tensor (B, 1, H, W) probabilidades [0,1].
+    """
+    best_thr = 0.5
+    best_iou = 0.0
+
+    # pasar a CPU/numpy si hace falta
+    y_true_np = y_true.detach().cpu().numpy().astype(np.uint8)
+    y_pred_np = y_pred.detach().cpu().numpy()
+
+    for thr in thresholds:
+        preds = (y_pred_np > thr).astype(np.uint8)
+        inter = (preds & y_true_np).sum()
+        union = (preds | y_true_np).sum()
+        iou = inter / (union + 1e-7)
+
+        if iou > best_iou:
+            best_iou = iou
+            best_thr = thr
+
+    return best_thr, best_iou
 
 
 def iou(mask1, mask2):
