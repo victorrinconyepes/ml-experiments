@@ -391,8 +391,8 @@ def main():
 
                     y_true_cls.extend(labels.cpu().numpy())
                     y_probs_cls.extend(torch.sigmoid(cls_out).cpu().numpy())
-                    all_val_true_masks.append(masks.cpu().numpy())
-                    all_val_pred_probs.append(torch.sigmoid(seg_out).cpu().numpy())
+                    all_val_true_masks.append(masks)  # sin .cpu().numpy()
+                    all_val_pred_probs.append(torch.sigmoid(seg_out))  # sin .cpu().numpy()
 
             all_val_true_masks = np.concatenate(all_val_true_masks, axis=0)
             all_val_pred_probs = np.concatenate(all_val_pred_probs, axis=0)
