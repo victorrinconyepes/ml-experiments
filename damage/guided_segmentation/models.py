@@ -87,6 +87,82 @@ class DualUNetPlusPlusGuided(nn.Module):
         return seg_logits, cls_logits
 
 
+class DualFPNGuided(nn.Module):
+    def __init__(self, backbone_name='efficientnet-b0', pretrained=True, in_channels=3, seg_classes=1,
+                 cls_classes=1, use_spatial_attn=True, use_film=True, film_hidden=512):
+        super().__init__()
+        self.seg_model = smp.FPN(
+            encoder_name=backbone_name,
+            encoder_weights='imagenet' if pretrained else None,
+            in_channels=in_channels,
+            classes=seg_classes,
+            activation=None
+        )
+        self.encoder = self.seg_model.encoder
+
+        c5 = self.encoder.out_channels[-1]
+
+        # Cabeza de clasificación
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.cls_fc = nn.Linear(c5, cls_classes)
+
+        # Salida final
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, 256, 256)
+            dfeat = self.seg_model(dummy)
+            cdec = dfeat.shape[1]
+        self.cdec = cdec
+
+        self.use_spatial_attn = use_spatial_attn
+        self.use_film = use_film
+
+        if use_spatial_attn:
+            self.ctx_proj = nn.Conv2d(c5, cdec, kernel_size=1)
+            self.attn_gen = nn.Sequential(
+                nn.Conv2d(cdec*2, cdec, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(cdec, cdec, kernel_size=3, padding=1),
+                nn.Sigmoid()
+            )
+
+        if use_film:
+            self.film = nn.Sequential(
+                nn.Linear(c5, film_hidden), nn.ReLU(inplace=True),
+                nn.Linear(film_hidden, 2*cdec)
+            )
+
+    def forward(self, x):
+        # features encoder
+        feats = self.encoder(x)
+        f5 = feats[-1]
+
+        # salida segmentación
+        dec = self.seg_model(x)  # FPN no tiene decoder explícito
+
+        # cls auxiliar
+        cls_logits = self.cls_fc(self.global_pool(f5).flatten(1))
+
+        # FiLM
+        if self.use_film:
+            ctx_vec = self.global_pool(f5).flatten(1)
+            gb = self.film(ctx_vec)
+            gamma, beta = torch.chunk(gb, 2, dim=1)
+            gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+            beta = beta.unsqueeze(-1).unsqueeze(-1)
+            dec = (1 + gamma) * dec + beta
+
+        # Atención espacial
+        if self.use_spatial_attn:
+            ctx = self.ctx_proj(f5)
+            ctx = F.interpolate(ctx, size=dec.shape[2:], mode='bilinear', align_corners=False)
+            attn_in = torch.cat([dec, ctx], dim=1)
+            attn_map = self.attn_gen(attn_in)
+            dec = dec * (1 + attn_map)
+
+        return dec, cls_logits
+
+
+
 class DualSatlasFPNGuided(nn.Module):
     """
     DualSatlasFPNGuided:

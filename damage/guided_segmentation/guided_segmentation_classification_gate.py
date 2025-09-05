@@ -2,12 +2,9 @@ import os
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     precision_recall_curve,f1_score,
     roc_auc_score, average_precision_score, accuracy_score
@@ -22,12 +19,10 @@ import mlflow
 from pyvexcelutils.aws.secrets import Secrets
 from pyvexcelutils.mlflow.mlflow_helper import setup_mlflow, MLFlowNamer
 
-
 from damage.datasets.dataset import CSVCroppedImagesDataset
 from damage.guided_segmentation.custom_metrics import iou_score, dice_score, seg_precision_recall, \
-    find_optimal_threshold, find_optimal_iou_threshold, pick_threshold_for_precision, find_optimal_pixel_f1_threshold
-from damage.guided_segmentation.models import DualUNetPlusPlusGuided
-from damage.guided_segmentation.utils import inference_and_test_metrics
+    find_optimal_iou_threshold
+from damage.guided_segmentation.models import DualUNetPlusPlusGuided, DualFPNGuided
 import cv2
 
 # ===========================
@@ -49,8 +44,8 @@ EARLY_STOP_PATIENCE = 7
 IMAGE_SIZE = 320
 classification_loss_weight = 0.1
 
-jira_ticket = "COPPER-2361"
-MLFLOW_RUN_NAME = f"GaussianDiceLoss(kernel_size=7, sigma=2, smooth=1e-6)) + {classification_loss_weight} * WeightedBCE/AdamW/Enc1e-5Dec+Cls1e-4/DualUNetPlusPlusGuided/efficientnet-b0"
+jira_ticket = "COPPER-2400"
+MLFLOW_RUN_NAME = f"GaussianDiceLoss(kernel_size=7, sigma=2, smooth=1e-6)) + {classification_loss_weight} * WeightedBCE/AdamW/{LR}/DualFPNGuided/efficientnet-b0"
 REMOVE_GRAYSKY = False
 
 BEST_MODEL_DIR = f"/ceph04/ml/property_damage_elements/datasets/ds-25-06-09_all_classes_MEDIUM_wrong_nir_fixes/test_guided_segmentation_element_{ELEMENT_INDEX}/fix"
@@ -73,47 +68,47 @@ OPENING_ITER = 1
 # Transformaciones
 # ===========================
 params = smp.encoders.get_preprocessing_params(backbone)
-# train_transform = A.Compose([
-#     A.Resize(IMAGE_SIZE, IMAGE_SIZE),
-#     A.HorizontalFlip(p=0.5),
-#     A.VerticalFlip(p=0.5),
-#     A.Rotate(limit=30, p=0.5),
-#     A.ColorJitter(brightness=0.4, contrast=0.432, saturation=0.4, hue=0.1, p=0.5),
-#     A.Normalize(mean=params['mean'], std=params['std']),
-#     ToTensorV2()
-# ])
-# val_transform = A.Compose([
-#     A.Resize(IMAGE_SIZE, IMAGE_SIZE),
-#     A.Normalize(mean=params['mean'], std=params['std']),
-#     ToTensorV2()
-# ])
 train_transform = A.Compose([
-    A.SmallestMaxSize(max_size=IMAGE_SIZE, interpolation=cv2.INTER_LINEAR),
-    A.PadIfNeeded(min_height=IMAGE_SIZE, min_width=IMAGE_SIZE,
-                  border_mode=cv2.BORDER_REFLECT_101),
-
-    A.RandomCrop(height=IMAGE_SIZE, width=IMAGE_SIZE),
-
+    A.Resize(IMAGE_SIZE, IMAGE_SIZE),
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.5),
-    A.Rotate(limit=10, border_mode=cv2.BORDER_REFLECT_101,
-             interpolation=cv2.INTER_LINEAR, p=0.5),
-
-    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-    A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=10, val_shift_limit=10, p=0.3),
-    A.Sharpen(alpha=(0.05, 0.2), lightness=(0.9, 1.1), p=0.2),
-
+    A.Rotate(limit=30, p=0.5),
+    A.ColorJitter(brightness=0.4, contrast=0.432, saturation=0.4, hue=0.1, p=0.5),
     A.Normalize(mean=params['mean'], std=params['std']),
     ToTensorV2()
 ])
 val_transform = A.Compose([
-    A.SmallestMaxSize(max_size=IMAGE_SIZE, interpolation=cv2.INTER_LINEAR),
-    A.PadIfNeeded(min_height=IMAGE_SIZE, min_width=IMAGE_SIZE,
-                  border_mode=cv2.BORDER_REFLECT_101),
-    A.CenterCrop(height=IMAGE_SIZE, width=IMAGE_SIZE),
+    A.Resize(IMAGE_SIZE, IMAGE_SIZE),
     A.Normalize(mean=params['mean'], std=params['std']),
     ToTensorV2()
 ])
+# train_transform = A.Compose([
+#     A.SmallestMaxSize(max_size=IMAGE_SIZE, interpolation=cv2.INTER_LINEAR),
+#     A.PadIfNeeded(min_height=IMAGE_SIZE, min_width=IMAGE_SIZE,
+#                   border_mode=cv2.BORDER_REFLECT_101),
+#
+#     A.RandomCrop(height=IMAGE_SIZE, width=IMAGE_SIZE),
+#
+#     A.HorizontalFlip(p=0.5),
+#     A.VerticalFlip(p=0.5),
+#     A.Rotate(limit=10, border_mode=cv2.BORDER_REFLECT_101,
+#              interpolation=cv2.INTER_LINEAR, p=0.5),
+#
+#     A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+#     A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=10, val_shift_limit=10, p=0.3),
+#     A.Sharpen(alpha=(0.05, 0.2), lightness=(0.9, 1.1), p=0.2),
+#
+#     A.Normalize(mean=params['mean'], std=params['std']),
+#     ToTensorV2()
+# ])
+# val_transform = A.Compose([
+#     A.SmallestMaxSize(max_size=IMAGE_SIZE, interpolation=cv2.INTER_LINEAR),
+#     A.PadIfNeeded(min_height=IMAGE_SIZE, min_width=IMAGE_SIZE,
+#                   border_mode=cv2.BORDER_REFLECT_101),
+#     A.CenterCrop(height=IMAGE_SIZE, width=IMAGE_SIZE),
+#     A.Normalize(mean=params['mean'], std=params['std']),
+#     ToTensorV2()
+# ])
 
 
 
@@ -254,7 +249,8 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=True)
 
-    model = DualUNetPlusPlusGuided(backbone_name='efficientnet-b0', pretrained=True).to(DEVICE)
+    # model = DualUNetPlusPlusGuided(backbone_name='efficientnet-b0', pretrained=True).to(DEVICE)
+    model = DualFPNGuided(backbone_name='efficientnet-b0', pretrained=True).to(DEVICE)
     model = torch.compile(model)
     torch.set_float32_matmul_precision('high')
 
@@ -267,19 +263,25 @@ def main():
     N_neg = len(df_train) - N_pos
     cls_loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([N_neg/N_pos], device=DEVICE))
 
-    # OPTIMIZADOR
-    dec_params = list(model.decoder.parameters()) + list(model.segmentation_head.parameters())
-    cls_params = list(model.cls_fc.parameters())
-    enc_params = list(model.encoder.parameters())
+    # # OPTIMIZADOR
+    # dec_params = list(model.decoder.parameters()) + list(model.segmentation_head.parameters())
+    # cls_params = list(model.cls_fc.parameters())
+    # enc_params = list(model.encoder.parameters())
 
-    optimizer = torch.optim.AdamW([
-        {"params": enc_params, "lr": 1e-5, "weight_decay": 1e-5},
-        {"params": dec_params + cls_params, "lr": 1e-4, "weight_decay": 1e-5},
-    ])
+    # optimizer = torch.optim.AdamW([
+    #     {"params": enc_params, "lr": 1e-5, "weight_decay": 1e-5},  # encoder
+    #     {"params": dec_params + cls_params, "lr": 1e-4, "weight_decay": 1e-5},  # FPN + cabeza
+    # ])
+
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
 
     metrics_history = {
-        "train_loss": [], "val_loss": [], "val_iou": [], "val_dice": [], "val_prec_seg": [], "val_rec_seg": [],
+        "train_loss": [], "val_loss": [],
+        "train_seg_loss": [], "train_cls_loss": [],
+        "val_seg_loss": [], "val_cls_loss": [],
+        "val_iou": [], "val_dice": [], "val_prec_seg": [], "val_rec_seg": [],
         "val_acc_cls": [], "val_f1_cls": [], "val_roc_auc_cls": [], "val_pr_auc_cls": []
     }
 
@@ -334,22 +336,40 @@ def main():
 
         for epoch in range(NUM_EPOCHS):
             model.train()
-            running_loss = 0
+            running_total_loss = 0.0
+            running_seg_loss = 0.0
+            running_cls_loss = 0.0
             for images, masks, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]"):
                 images, masks, labels = images.to(DEVICE), masks.to(DEVICE), labels.to(DEVICE).unsqueeze(1)
                 seg_out, cls_out = model(images)
-                loss = seg_loss_fn(seg_out, masks) + classification_loss_weight * cls_loss_fn(cls_out, labels)
+
+                seg_loss = seg_loss_fn(seg_out, masks)
+                cls_loss = cls_loss_fn(cls_out, labels)
+                loss = seg_loss + classification_loss_weight * cls_loss
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
 
-                running_loss += loss.item() * images.size(0)
-            metrics_history["train_loss"].append(running_loss / len(train_loader.dataset))
+                batch_size = images.size(0)
+                running_total_loss += loss.item() * batch_size
+                running_seg_loss += seg_loss.item() * batch_size
+                running_cls_loss += cls_loss.item() * batch_size
+
+            # metrics_history["train_loss"].append(running_loss / len(train_loader.dataset))
+            train_loss_epoch = running_total_loss / len(train_loader.dataset)
+            train_seg_loss_epoch = running_seg_loss / len(train_loader.dataset)
+            train_cls_loss_epoch = running_cls_loss / len(train_loader.dataset)
+
+            metrics_history["train_loss"].append(train_loss_epoch)
+            metrics_history["train_seg_loss"].append(train_seg_loss_epoch)
+            metrics_history["train_cls_loss"].append(train_cls_loss_epoch)
 
             # Validación
             model.eval()
-            val_loss = 0
+            val_total_loss = 0.0
+            val_seg_component = 0.0
+            val_cls_component = 0.0
             val_iou, val_dice, val_prec_seg, val_rec_seg = 0, 0, 0, 0
             y_true_cls, y_probs_cls = [], []
             all_val_true_masks = []
@@ -359,8 +379,16 @@ def main():
                 for images, masks, labels in val_loader:
                     images, masks, labels = images.to(DEVICE), masks.to(DEVICE), labels.to(DEVICE).unsqueeze(1)
                     seg_out, cls_out = model(images)
-                    loss = seg_loss_fn(seg_out, masks) + classification_loss_weight * cls_loss_fn(cls_out, labels)
-                    val_loss += loss.item() * images.size(0)
+
+                    seg_loss = seg_loss_fn(seg_out, masks)
+                    cls_loss = cls_loss_fn(cls_out, labels)
+                    loss = seg_loss + classification_loss_weight * cls_loss
+
+                    batch_size = images.size(0)
+                    val_total_loss += loss.item() * batch_size
+                    val_seg_component += seg_loss.item() * batch_size
+                    val_cls_component += cls_loss.item() * batch_size
+
 
                     val_iou += iou_score(seg_out, masks) * images.size(0)
                     val_dice += dice_score(seg_out, masks) * images.size(0)
@@ -374,13 +402,17 @@ def main():
                     all_val_pred_probs.extend(torch.sigmoid(seg_out).cpu().numpy())
 
             n_val = len(val_loader.dataset)
-            val_loss /= n_val
+            val_loss_epoch = val_total_loss / n_val
+            val_seg_loss_epoch = val_seg_component / n_val
+            val_cls_loss_epoch = val_cls_component / n_val
             val_iou /= n_val
             val_dice /= n_val
             val_prec_seg /= n_val
             val_rec_seg /= n_val
 
-            metrics_history["val_loss"].append(val_loss)
+            metrics_history["val_loss"].append(val_loss_epoch)
+            metrics_history["val_seg_loss"].append(val_seg_loss_epoch)
+            metrics_history["val_cls_loss"].append(val_cls_loss_epoch)
 
             y_true_cls = np.array(y_true_cls).flatten()
             y_probs_cls = np.array(y_probs_cls).flatten()
@@ -396,8 +428,13 @@ def main():
             metrics_history["val_pr_auc_cls"].append(average_precision_score(y_true_cls, y_probs_cls))
 
             # Log metrics per epoch
-            mlflow.log_metric("train_loss", metrics_history["train_loss"][-1], step=epoch)
-            mlflow.log_metric("val_loss", val_loss, step=epoch)
+            mlflow.log_metric("train_loss", train_loss_epoch, step=epoch)
+            mlflow.log_metric("train_seg_loss", train_seg_loss_epoch, step=epoch)
+            mlflow.log_metric("train_cls_loss", train_cls_loss_epoch, step=epoch)
+            mlflow.log_metric("val_loss", val_loss_epoch, step=epoch)
+            mlflow.log_metric("val_seg_loss", val_seg_loss_epoch, step=epoch)
+            mlflow.log_metric("val_cls_loss", val_cls_loss_epoch, step=epoch)
+
             mlflow.log_metric("val_iou", val_iou, step=epoch)
             mlflow.log_metric("val_dice", val_dice, step=epoch)
             mlflow.log_metric("val_prec_seg", val_prec_seg, step=epoch)
@@ -413,9 +450,14 @@ def main():
 
             # Buscar threshold óptimo para IoU
             best_threshold_iou, best_iou = find_optimal_iou_threshold(all_val_true_masks, all_val_pred_probs)
-            print(f"Epoch {epoch+1}: Loss(val)={val_loss:.4f}, IoU={val_iou:.4f}, Dice={val_dice:.4f}, Prec(seg)={val_prec_seg:.4f}, Rec(seg)={val_rec_seg:.4f}, "
-                  f"Acc(cls)={metrics_history['val_acc_cls'][-1]:.3f}, F1(cls)={metrics_history['val_f1_cls'][-1]:.3f}, Threshold_cls={best_threshold:.3f}, Threshold_iou={best_threshold_iou:.3f}")
-
+            print(
+                f"Epoch {epoch + 1}: "
+                f"TrainLoss={train_loss_epoch:.4f} (Seg={train_seg_loss_epoch:.4f}, Cls={train_cls_loss_epoch:.4f}) | "
+                f"ValLoss={val_loss_epoch:.4f} (Seg={val_seg_loss_epoch:.4f}, Cls={val_cls_loss_epoch:.4f}) | "
+                f"IoU={val_iou:.4f}, Dice={val_dice:.4f}, Prec(seg)={val_prec_seg:.4f}, Rec(seg)={val_rec_seg:.4f} | "
+                f"Acc(cls)={metrics_history['val_acc_cls'][-1]:.3f}, F1(cls)={metrics_history['val_f1_cls'][-1]:.3f} | "
+                f"Thr_cls={best_threshold:.3f}, Thr_iou={best_threshold_iou:.3f}"
+            )
             scheduler.step(val_iou)
 
             if val_iou > best_val_iou:
