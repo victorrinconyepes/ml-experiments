@@ -391,9 +391,11 @@ def main():
 
                     y_true_cls.extend(labels.cpu().numpy())
                     y_probs_cls.extend(torch.sigmoid(cls_out).cpu().numpy())
-                    all_val_true_masks.extend(masks.cpu().numpy())
-                    all_val_pred_probs.extend(torch.sigmoid(seg_out).cpu().numpy())
+                    all_val_true_masks.append(masks.cpu().numpy())
+                    all_val_pred_probs.append(torch.sigmoid(seg_out).cpu().numpy())
 
+            all_val_true_masks = np.concatenate(all_val_true_masks, axis=0)
+            all_val_pred_probs = np.concatenate(all_val_pred_probs, axis=0)
             n_val = len(val_loader.dataset)
             val_loss_epoch = val_total_loss / n_val
             val_seg_loss_epoch = val_seg_component / n_val
