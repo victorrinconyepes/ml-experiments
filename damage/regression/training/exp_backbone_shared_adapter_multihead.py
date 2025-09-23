@@ -974,7 +974,7 @@ def main():
             train_loader, model, criterion, device, optimizer,
             target_cols, thresholds_map,
             global_step=global_step,
-            log_pos_counts=True  # Activa logging
+            log_pos_counts=False  # Activa logging
         )
         val_metrics, y_true_raw_val, y_pred_raw_val, _ = run_epoch(
             val_loader, model, criterion, device, None,
