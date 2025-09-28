@@ -1014,9 +1014,24 @@ def main():
             }
             torch.save(best_state, args.model_save)
             print(f"*** Nuevo mejor modelo guardado ({args.model_save}) sel_metric={best_score:.4f}")
+
+            # --- Guardar y loguear percentiles para el mejor modelo ---
+            df_bin_metrics = metrics_by_percentiles(
+                y_true=y_true_raw_val,
+                y_pred=y_pred_raw_val,
+                target_cols=target_cols,
+                thresholds_map=thresholds_map,
+                n_bins=args.percentile_bins
+            )
+            bin_csv = f"val_metrics_by_percentile_epoch{epoch}.csv"
+            df_bin_metrics.to_csv(bin_csv, index=False)
+            print(f"[INFO] Percentiles guardados para mejor modelo: {bin_csv}")
+
             if args.mlflow:
                 import mlflow
                 mlflow.log_artifact(args.model_save, artifact_path="model")
+                mlflow.log_artifact(bin_csv, artifact_path="percentiles")  # <- loguea el csv de percentiles
+
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
