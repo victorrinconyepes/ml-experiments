@@ -1,12 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Multi-Head Multi-Output Regression (log1p) con:
-- Backbone compartido (timm) + bloque adaptador + una cabeza por target.
-- LRs independientes por grupo: backbone, shared y cada cabeza.
-- Schedulers independientes (tipo ReduceLROnPlateau manual) para backbone, shared y cada head.
-- Pérdida L1 enmascarada con warmup de ceros + regularización suave.
-- Métricas por target (mae, mae_pos, etc.) para dirigir los schedulers de cada cabeza.
+Multi-Head Multi-Output Regression (log1p original) + métricas de ranking (MAPercE, Spearman)
+Mejoras priorizadas solicitadas:
+1. Bins para métricas por percentiles fijados a partir del conjunto de entrenamiento (estables entre runs).
+2. Métrica de ranking MAPercE (Mean Absolute Percentile Error) por target + macro.
+3. Spearman por target + macro (además de Pearson existente).
+4. Selección de mejor modelo usando macro/maperce (si disponible) como métrica principal.
+(No se añadieron nuevos argumentos CLI.)
+
+NOTA: Se mantiene la transformación log1p original para no alterar todavía la escala (siguiente fase
+podría ser la transformación CDF normalizada). El resto del flujo se respeta.
 """
 
 import os
@@ -79,6 +83,7 @@ def validate_thresholds(target_cols: List[str], thresholds: Dict[str, float]) ->
 
 
 def inverse_transform(y_tr: torch.Tensor) -> torch.Tensor:
+    # Transformación inversa del log1p(y/100)
     y_norm = torch.expm1(y_tr).clamp(min=0)
     return (y_norm * 100.0).clamp(0, 100)
 
@@ -141,7 +146,7 @@ class MultiOutputRegressorHybrid(nn.Module):
                 lname = name.lower()
                 if any(k in lname for k in ["norm", "bn", "layernorm"]):
                     p.requires_grad = True
-            # Descongelar últimos stages
+            # Descongelar últimos stages (heurístico para modelos tipo convnext)
             for name, p in self.backbone.named_parameters():
                 for k in range(4 - unfreeze_last_n_stages, 4):
                     if f"stages.{k}." in name:
@@ -194,7 +199,7 @@ def build_dynamic_loss_fn(zero_weight: float, lambda_zero: float):
 
 
 # -------------------------------
-# Métricas por target
+# Métricas auxiliares
 # -------------------------------
 def coverage_within(y_true: np.ndarray, y_pred: np.ndarray, tol: float = 5.0):
     return float(np.mean(np.abs(y_true - y_pred) <= tol)) if len(y_true) else float("nan")
@@ -209,21 +214,53 @@ def mae_top_k(y_true: np.ndarray, y_pred: np.ndarray, k: float = 0.10):
     return float(np.mean(np.abs(y_true[idx] - y_pred[idx])))
 
 
+def mean_abs_percentile_error_one(yt: np.ndarray, yp: np.ndarray) -> float:
+    """
+    MAPercE: error absoluto medio en percentiles usando la CDF empírica de yt.
+    """
+    n = len(yt)
+    if n == 0:
+        return float("nan")
+    order = np.argsort(yt)
+    ranks_true = np.empty_like(order)
+    ranks_true[order] = np.arange(n)
+    pct_true = (ranks_true + 0.5) / n
+
+    yt_sorted = yt[order]
+    # Para cada pred, buscamos su posición de inserción en yt_sorted
+    pos = np.searchsorted(yt_sorted, yp, side="right")
+    pct_pred = (pos - 0.5) / n
+    return float(np.mean(np.abs(pct_true - pct_pred)))
+
+
 def compute_per_target_metrics(
     y_true_raw: np.ndarray,
     y_pred_raw: np.ndarray,
     target_cols: List[str],
     thresholds_map: Dict[str, float],
 ) -> Dict[str, float]:
+    """
+    Agregamos:
+    - spearman por target + macro
+    - maperce por target + macro
+    """
+    from scipy.stats import spearmanr
+
     metrics = {}
     mae_list, mae_pos_list, rel_mae_list, q90_list, medae_list = [], [], [], [], []
     coverage_pos_list, mae_top10_list = [], []
-    r2_list, corr_list = [], []
+    r2_list, pearson_list, spearman_list = [], [], []
+    maperce_list = []
     eps = 1e-6
 
     for i, col in enumerate(target_cols):
         yt = y_true_raw[:, i]
         yp = y_pred_raw[:, i]
+
+        # MAPercE
+        maperce = mean_abs_percentile_error_one(yt, yp)
+        maperce_list.append(maperce)
+
         mae = mean_absolute_error(yt, yp)
         mae_list.append(mae)
 
@@ -246,17 +283,32 @@ def compute_per_target_metrics(
         coverage_pos_list.append(coverage_pos)
         mae_top10_list.append(mae_top10)
 
+        # R2
         try:
             r2 = r2_score(yt, yp)
         except Exception:
             r2 = float("nan")
         r2_list.append(r2)
 
+        # Pearson
         if np.std(yt) > 1e-6 and np.std(yp) > 1e-6:
-            corr = float(np.corrcoef(yt, yp)[0, 1])
+            pearson = float(np.corrcoef(yt, yp)[0, 1])
         else:
-            corr = float("nan")
-        corr_list.append(corr)
+            pearson = float("nan")
+        pearson_list.append(pearson)
+
+        # Spearman
+        try:
+            if len(yt) >= 8:
+                sp = spearmanr(yt, yp).correlation
+                if isinstance(sp, float):
+                    spearman_list.append(float(sp))
+                else:
+                    spearman_list.append(float("nan"))
+            else:
+                spearman_list.append(float("nan"))
+        except Exception:
+            spearman_list.append(float("nan"))
 
         thr = thresholds_map.get(col, 0.1)
         pred_pos = yp > thr
@@ -272,6 +324,7 @@ def compute_per_target_metrics(
                   if precision_pos and recall_pos and (precision_pos + recall_pos) > 0 else np.nan)
 
         metrics.update({
+            f"{col}/maperce": maperce,
             f"{col}/mae": mae,
             f"{col}/mae_pos": mae_pos,
             f"{col}/rel_mae_pos": rel_mae,
@@ -280,7 +333,8 @@ def compute_per_target_metrics(
             f"{col}/coverage_pm5_pos": coverage_pos,
             f"{col}/mae_top10pct_pos": mae_top10,
             f"{col}/r2": r2,
-            f"{col}/corr": corr,
+            f"{col}/corr": pearson,
+            f"{col}/spearman": spearman_list[-1],
             f"{col}/precision_pos_thr{thr}": precision_pos,
             f"{col}/recall_pos_thr{thr}": recall_pos,
             f"{col}/recall_zero_thr{thr}": recall_zero,
@@ -292,6 +346,7 @@ def compute_per_target_metrics(
         return float(np.mean(arr2)) if arr2 else float("nan")
 
     metrics.update({
+        "macro/maperce": _nm(maperce_list),
         "macro/mae": _nm(mae_list),
         "macro/mae_pos": _nm(mae_pos_list),
         "macro/rel_mae_pos": _nm(rel_mae_list),
@@ -300,7 +355,8 @@ def compute_per_target_metrics(
         "macro/coverage_pm5_pos": _nm(coverage_pos_list),
         "macro/mae_top10pct_pos": _nm(mae_top10_list),
         "macro/r2": _nm(r2_list),
-        "macro/corr": _nm(corr_list),
+        "macro/corr": _nm(pearson_list),
+        "macro/spearman": _nm(spearman_list),
     })
     return metrics
 
@@ -312,14 +368,14 @@ def print_metrics(metrics: Dict):
     for k in sorted(target_keys):
         v = metrics[k]
         if isinstance(v, float):
-            print(f"{k}: {v:.4f}" if not math.isnan(v) else f"{k}: nan")
+            print(f"{k}: {v:.6f}" if not math.isnan(v) else f"{k}: nan")
         else:
             print(f"{k}: {v}")
     print("=== Métricas macro ===")
     for k in sorted(macro_keys):
         v = metrics[k]
         if isinstance(v, float):
-            print(f"{k}: {v:.4f}" if not math.isnan(v) else f"{k}: nan")
+            print(f"{k}: {v:.6f}" if not math.isnan(v) else f"{k}: nan")
         else:
             print(f"{k}: {v}")
 
@@ -396,11 +452,15 @@ def evaluate_zero_baseline(df: pd.DataFrame, target_cols: List[str], thresholds_
     eps = 1e-6
     mae_pos_list, rel_mae_list, medae_list, q90_list = [], [], [], []
     coverage_pos_list, mae_top10_list = [], []
-    mae_list, r2_list, corr_list = [], [], []
+    mae_list, r2_list, corr_list, maperce_list, spearman_list = [], [], [], [], []
+    from scipy.stats import spearmanr
     for col in target_cols:
         yt = df[col].values.astype("float32")
         yp = np.zeros_like(yt)
         mae = mean_absolute_error(yt, yp); mae_list.append(mae)
+        # MAPercE
+        maperce = mean_abs_percentile_error_one(yt, yp)
+        maperce_list.append(maperce)
         mask_pos = yt > eps
         if mask_pos.any():
             yt_pos = yt[mask_pos]; yp_pos = yp[mask_pos]
@@ -420,6 +480,12 @@ def evaluate_zero_baseline(df: pd.DataFrame, target_cols: List[str], thresholds_
             r2 = float("nan")
         r2_list.append(r2)
         corr_list.append(float("nan"))
+        # Spearman
+        try:
+            sp = spearmanr(yt, yp).correlation
+            spearman_list.append(float(sp) if isinstance(sp, float) else float("nan"))
+        except Exception:
+            spearman_list.append(float("nan"))
         thr = thresholds_map.get(col, 0.1)
         pred_pos = yp > thr; true_pos = yt > thr
         tp = np.logical_and(pred_pos, true_pos).sum()
@@ -429,6 +495,7 @@ def evaluate_zero_baseline(df: pd.DataFrame, target_cols: List[str], thresholds_
         recall_pos = tp / (tp + fn) if (tp + fn) > 0 else np.nan
         recall_zero = tn / (tn + fp) if (tn + fp) > 0 else np.nan
         metrics.update({
+            f"{col}/maperce": maperce,
             f"{col}/mae": mae,
             f"{col}/mae_pos": mae_pos,
             f"{col}/rel_mae_pos": rel_mae,
@@ -439,6 +506,7 @@ def evaluate_zero_baseline(df: pd.DataFrame, target_cols: List[str], thresholds_
             f"{col}/r2": r2,
             f"{col}/recall_pos_thr{thr}": recall_pos,
             f"{col}/recall_zero_thr{thr}": recall_zero,
+            f"{col}/spearman": spearman_list[-1],
         })
 
     def _nm(a):
@@ -446,6 +514,7 @@ def evaluate_zero_baseline(df: pd.DataFrame, target_cols: List[str], thresholds_
         return float(np.mean(b)) if b else float("nan")
 
     metrics.update({
+        "macro/maperce": _nm(maperce_list),
         "macro/mae": _nm(mae_list),
         "macro/mae_pos": _nm(mae_pos_list),
         "macro/rel_mae_pos": _nm(rel_mae_list),
@@ -454,6 +523,7 @@ def evaluate_zero_baseline(df: pd.DataFrame, target_cols: List[str], thresholds_
         "macro/coverage_pm5_pos": _nm(coverage_pos_list),
         "macro/mae_top10pct_pos": _nm(mae_top10_list),
         "macro/r2": _nm(r2_list),
+        "macro/spearman": _nm(spearman_list),
     })
     return metrics
 
@@ -557,21 +627,6 @@ def build_optimizer_with_groups(model: MultiOutputRegressorHybrid,
 # Scheduler individual por param_group
 # -------------------------------
 class SingleGroupPlateauScheduler:
-    """
-    Scheduler tipo ReduceLROnPlateau para UN solo param_group (por name).
-    Métrica arbitraria del dict de métricas de validación.
-
-    Parámetros:
-        optimizer: torch.optim.Optimizer
-        group_name: str
-        metric_key: str
-        mode: 'min' (default) o 'max'
-        factor: multiplicador al reducir
-        patience: epochs sin mejora antes de reducir
-        min_lr: LR mínimo
-        eps: delta mínimo para considerar mejora
-        verbose: bool
-    """
     def __init__(self,
                  optimizer: torch.optim.Optimizer,
                  group_name: str,
@@ -629,20 +684,25 @@ class SingleGroupPlateauScheduler:
                     group["lr"] = new_lr
                     if self.verbose:
                         print(f"[Scheduler:{self.group_name}] Reduce LR {old_lr:.3e} -> {new_lr:.3e} "
-                              f"(metric={self.metric_key} val={current:.4f})")
+                              f"(metric={self.metric_key} val={current:.6f})")
                 self.bad_epochs = 0
 
 
 # -------------------------------
-# Métricas por percentiles
+# Métricas por percentiles (bins)
 # -------------------------------
 def metrics_by_percentiles(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     target_cols: List[str],
     thresholds_map: Dict[str, float],
-    n_bins: int = 10
+    n_bins: int = 10,
+    precomputed_cuts: Optional[Dict[str, np.ndarray]] = None
 ) -> pd.DataFrame:
+    """
+    Si precomputed_cuts se pasa, se usan esos cortes (ya excluyen el bin cero), que
+    se definieron sobre y_true positivo de entrenamiento.
+    """
     from scipy.stats import spearmanr
     rows = []
     eps = 1e-6
@@ -688,10 +748,21 @@ def metrics_by_percentiles(
         if not mask_pos.any():
             continue
         yt_pos = yt_full[mask_pos]; yp_pos = yp_full[mask_pos]
-        percentiles = np.linspace(0, 100, n_bins + 1)
-        cuts = np.unique(np.percentile(yt_pos, percentiles))
+
+        if precomputed_cuts and col in precomputed_cuts and precomputed_cuts[col] is not None:
+            cuts = precomputed_cuts[col]
+        else:
+            percentiles = np.linspace(0, 100, n_bins + 1)
+            cuts = np.percentile(yt_pos, percentiles)
+        cuts = np.asarray(cuts, dtype=float)
+        # asegurar estricta monotonía
+        for ci in range(1, len(cuts)):
+            if cuts[ci] <= cuts[ci-1]:
+                cuts[ci] = cuts[ci-1] + 1e-6
         if len(cuts) <= 1:
             continue
+
+        # Bins semiabiertos [start, end] excepto que mantenemos <= end (mantener compatibilidad)
         for b in range(len(cuts) - 1):
             start, end = cuts[b], cuts[b + 1]
             m_bin = (yt_pos >= start) & (yt_pos <= end)
@@ -701,8 +772,8 @@ def metrics_by_percentiles(
             bin_range = end - start
             mae = mean_absolute_error(yt_bin, yp_bin)
             medae_val = median_absolute_error(yt_bin, yp_bin)
-            rel_mae = mae / (yt_bin.mean() + eps)
-            nrm_mae = mae / (bin_range + eps) if bin_range > 0 else float("nan")
+            rel_mae = mae / (yt_bin.mean() + 1e-6)
+            nrm_mae = mae / (bin_range + 1e-6) if bin_range > 0 else float("nan")
             q90 = float(np.percentile(np.abs(yt_bin - yp_bin), 90))
             if len(yt_bin) >= 8 and np.std(yt_bin) > 1e-6 and np.std(yp_bin) > 1e-6:
                 try:
@@ -741,6 +812,31 @@ def metrics_by_percentiles(
 
 
 # -------------------------------
+# Cálculo de cortes fijos en train
+# -------------------------------
+def compute_fixed_cuts(train_df: pd.DataFrame, target_cols: List[str], n_bins: int, eps: float = 1e-6) -> Dict[str, np.ndarray]:
+    """
+    Devuelve diccionario: target -> cortes (array) para valores positivos (excluye bin cero).
+    Se basan SOLO en train para estabilizar comparaciones.
+    """
+    cuts_dict = {}
+    for col in target_cols:
+        arr = train_df[col].values.astype(float)
+        pos = arr[arr > eps]
+        if len(pos) < 2:
+            cuts_dict[col] = None
+            continue
+        percentiles = np.linspace(0, 100, n_bins + 1)
+        cuts = np.percentile(pos, percentiles)
+        # asegurar estricta monotonía
+        for i in range(1, len(cuts)):
+            if cuts[i] <= cuts[i-1]:
+                cuts[i] = cuts[i-1] + 1e-6
+        cuts_dict[col] = cuts
+    return cuts_dict
+
+
+# -------------------------------
 # MLflow init
 # -------------------------------
 def maybe_init_mlflow(args, target_cols):
@@ -772,7 +868,6 @@ def maybe_init_mlflow(args, target_cols):
         "backbone_lr": args.backbone_lr,
         "shared_lr": args.shared_lr,
         "head_lrs": None if not args.head_lrs else ",".join(str(x) for x in args.head_lrs),
-        # Scheduler params
         "scheduler_metric_heads": args.scheduler_metric_heads,
         "scheduler_patience_heads": args.scheduler_patience_heads,
         "scheduler_factor_heads": args.scheduler_factor_heads,
@@ -895,6 +990,20 @@ def main():
     print("\nBaseline cero (val):")
     print_metrics(zero_val_metrics)
 
+    # Cortes fijos de train para percentiles
+    fixed_cuts = compute_fixed_cuts(train_df, target_cols, n_bins=args.percentile_bins)
+    print("\nCortes fijos (train) por target (primeros y últimos 3 valores si existen):")
+    for col in target_cols:
+        cuts = fixed_cuts.get(col)
+        if cuts is None:
+            print(f"- {col}: sin positivos suficientes para cortes.")
+        else:
+            if len(cuts) <= 6:
+                preview = cuts
+            else:
+                preview = np.concatenate([cuts[:3], cuts[-3:]])
+            print(f"- {col}: total={len(cuts)} preview={preview}")
+
     train_tf, val_tf = build_transforms(args.img_size)
     train_ds = MultiTargetImageDataset(train_df, target_cols, transform=train_tf)
     val_ds = MultiTargetImageDataset(val_df, target_cols, transform=val_tf)
@@ -949,10 +1058,8 @@ def main():
     factor_shared = args.scheduler_factor_shared if args.scheduler_factor_shared is not None else args.scheduler_factor_heads
     patience_shared = args.scheduler_patience_shared if args.scheduler_patience_shared is not None else args.scheduler_patience_heads
     min_lr_shared = args.scheduler_min_lr_shared if args.scheduler_min_lr_shared is not None else args.scheduler_min_lr_heads
-    metric_shared = args.scheduler_metric_shared  # usualmente macro/mae_pos
+    metric_shared = args.scheduler_metric_shared  # se mantiene
 
-    # Fallback si macro/mae_pos no estuviera (se aplicará al construir métricas)
-    # Crear scheduler para backbone
     if any(g.get("name", "") == "backbone" for g in optimizer.param_groups):
         schedulers.append(
             SingleGroupPlateauScheduler(
@@ -966,7 +1073,6 @@ def main():
                 verbose=True
             )
         )
-    # Crear scheduler para shared
     if any(g.get("name", "") == "shared" for g in optimizer.param_groups):
         schedulers.append(
             SingleGroupPlateauScheduler(
@@ -1037,25 +1143,27 @@ def main():
         y_true_val = inverse_transform(y_true_val_log).numpy()
         y_pred_val = inverse_transform(y_pred_val_log).numpy()
 
-        # Métricas por target
         train_target_metrics = compute_per_target_metrics(y_true_tr, y_pred_tr, target_cols, thresholds_map)
         val_target_metrics = compute_per_target_metrics(y_true_val, y_pred_val, target_cols, thresholds_map)
 
         train_metrics = {"loss_raw_space": train_loss, **train_target_metrics}
         val_metrics = {"loss_raw_space": val_loss, **val_target_metrics}
 
-        # Fallback macro/mae_pos -> macro/mae si no existe (para schedulers de shared/backbone)
         if "macro/mae_pos" not in val_metrics and "macro/mae" in val_metrics:
             val_metrics["macro/mae_pos"] = val_metrics["macro/mae"]
 
-        selection_metric = (val_metrics.get("macro/mae_pos") or
-                            val_metrics.get("macro/mae") or
-                            val_metrics["loss_raw_space"])
+        # Selección de modelo priorizando ranking (macro/maperce)
+        selection_metric = (
+            val_metrics.get("macro/maperce")
+            if not math.isnan(val_metrics.get("macro/maperce", float("nan")))
+            else (val_metrics.get("macro/mae_pos") or val_metrics.get("macro/mae") or val_metrics["loss_raw_space"])
+        )
 
         print("\n-- Train Metrics --")
         print_metrics(train_metrics)
         print("\n-- Val Metrics --")
         print_metrics(val_metrics)
+        print(f"\n[INFO] selection_metric (epoch {epoch}) = {selection_metric:.6f}")
 
         # MLflow logging
         if args.mlflow:
@@ -1077,20 +1185,22 @@ def main():
                 "val_selection_metric": best_score,
                 "args": vars(args),
                 "target_cols": target_cols,
-                "thresholds_map": thresholds_map
+                "thresholds_map": thresholds_map,
+                "fixed_cuts": fixed_cuts
             }
             torch.save(best_state, args.model_save)
-            print(f"*** Nuevo mejor modelo ({args.model_save}) sel_metric={best_score:.4f}")
+            print(f"*** Nuevo mejor modelo ({args.model_save}) sel_metric={best_score:.6f}")
             df_bin_metrics = metrics_by_percentiles(
                 y_true=y_true_val,
                 y_pred=y_pred_val,
                 target_cols=target_cols,
                 thresholds_map=thresholds_map,
-                n_bins=args.percentile_bins
+                n_bins=args.percentile_bins,
+                precomputed_cuts=fixed_cuts
             )
             bin_csv = f"val_metrics_by_percentile_epoch{epoch}.csv"
             df_bin_metrics.to_csv(bin_csv, index=False)
-            print(f"[INFO] Percentiles guardados para mejor modelo: {bin_csv}")
+            print(f"[INFO] Percentiles (cortes fijos train) guardados: {bin_csv}")
             if args.mlflow:
                 import mlflow
                 mlflow.log_artifact(args.model_save, artifact_path="model")
@@ -1127,7 +1237,7 @@ def main():
     if "macro/mae" in final_metrics and "macro/mae" in zero_val_metrics:
         delta = zero_val_metrics["macro/mae"] - final_metrics["macro/mae"]
         final_metrics["delta_vs_zero/macro_mae"] = delta
-        print(f"\nDelta macro/mae vs baseline cero: {delta:.4f}")
+        print(f"\nDelta macro/mae vs baseline cero: {delta:.6f}")
 
     # Guardar predicciones
     val_pred_df = pd.DataFrame({"image_path": val_df["image_path"].values})
@@ -1152,14 +1262,15 @@ def main():
         y_pred=y_pred_val,
         target_cols=target_cols,
         thresholds_map=thresholds_map,
-        n_bins=args.percentile_bins
+        n_bins=args.percentile_bins,
+        precomputed_cuts=fixed_cuts
     )
     bin_csv = "val_metrics_by_percentile.csv"
     df_bin_metrics.to_csv(bin_csv, index=False)
 
     print(f"Predicciones: {pred_csv}")
     print(f"Ordenado por error: {error_csv}")
-    print(f"Percentiles: {bin_csv}")
+    print(f"Percentiles (cortes fijos train): {bin_csv}")
 
     if args.mlflow:
         import mlflow
@@ -1170,7 +1281,7 @@ def main():
         mlflow.log_artifact(bin_csv, artifact_path="predictions")
         mlflow.end_run()
 
-    print("\nListo. Entrenamiento multi-head completado.")
+    print("\nListo. Entrenamiento multi-head completado (con MAPercE y cortes fijos).")
 
 
 if __name__ == "__main__":
