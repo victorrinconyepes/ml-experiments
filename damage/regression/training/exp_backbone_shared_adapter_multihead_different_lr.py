@@ -13,15 +13,19 @@ import os
 import math
 import argparse
 from typing import List, Dict, Optional
+
+import cv2
 import numpy as np
 import pandas as pd
 from PIL import Image
+from albumentations import ToTensorV2
 from tqdm import tqdm
 
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+import albumentations as A
 
 try:
     import timm
@@ -461,24 +465,33 @@ def mlflow_log_metrics(step: int, metrics: Dict, prefix: str = ""):
             mlflow.log_metric(prefix + k, float(v), step=step)
 
 
-def build_transforms(img_size: int):
-    train_tf = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.4721, 0.4410, 0.3985],
-                             std=[0.2312, 0.2230, 0.2147])
+def build_transforms(img_size=224, mean=(0.4721, 0.4410, 0.3985), std=(0.2312, 0.2230, 0.2147)):
+    aug_train = A.Compose([
+        A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
+        A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=cv2.BORDER_CONSTANT, fill=(0, 0, 0)),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.Rotate(limit=15, border_mode=cv2.BORDER_CONSTANT, value=(0, 0, 0), p=0.5),
+        A.Normalize(mean=mean, std=std),
+        ToTensorV2()
     ])
-    val_tf = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.4721, 0.4410, 0.3985],
-                             std=[0.2312, 0.2230, 0.2147])
+    aug_val = A.Compose([
+        A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
+        A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=cv2.BORDER_CONSTANT, fill=(0, 0, 0)),
+        A.Normalize(mean=mean, std=std),
+        ToTensorV2()
     ])
-    return train_tf, val_tf
 
+    def wrap(aug):
+        def f(img):
+            if hasattr(img, "mode"):  # PIL
+                img = np.array(img)
+            return aug(image=img)["image"]
+        return f
+
+    train_tf = wrap(aug_train)
+    val_tf = wrap(aug_val)
+    return train_tf, val_tf
 
 # -------------------------------
 # Optimizer con grupos
